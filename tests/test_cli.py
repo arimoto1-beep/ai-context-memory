@@ -10,12 +10,12 @@ from ai_context_memory.llm import LLMError
 
 
 class EchoLLM:
-    def complete(self, messages):
+    def complete(self, messages, memories=()):
         return f"echo: {messages[-1]['content']}"
 
 
 class FailingLLM:
-    def complete(self, messages):
+    def complete(self, messages, memories=()):
         raise LLMError("接続できません")
 
 
@@ -80,13 +80,19 @@ def test_exit_command_is_not_saved_to_history(tmp_path):
     ]
 
 
-def test_conversation_continues_after_restart(tmp_path):
+def test_restart_starts_a_new_conversation_and_keeps_saved_history(tmp_path):
     path = tmp_path / "conversation.jsonl"
     run_cli(EchoLLM(), ["私の名前はテスト太郎です", "exit"], path)
 
     _, session = run_cli(EchoLLM(), ["前回私が名乗った名前は？", "exit"], path)
 
+    # 再起動前の会話は現在の会話履歴へ戻さない（MVP3）
     assert [m["content"] for m in session.messages] == [
+        "前回私が名乗った名前は？",
+        "echo: 前回私が名乗った名前は？",
+    ]
+    # 原文は証拠としてすべて残る
+    assert [m["content"] for m in load_history(path)] == [
         "私の名前はテスト太郎です",
         "echo: 私の名前はテスト太郎です",
         "前回私が名乗った名前は？",
@@ -117,25 +123,35 @@ class FakeStdin(io.StringIO):
 @pytest.fixture
 def main_env(tmp_path, monkeypatch):
     """main() を実データ領域にも実際の claude にも触れさせずに動かす。"""
-    path = tmp_path / "conversation.jsonl"
-    monkeypatch.setenv("ACM_HISTORY_FILE", str(path))
+    path = tmp_path / "memories.jsonl"
+    monkeypatch.setenv("ACM_HISTORY_FILE", str(tmp_path / "conversation.jsonl"))
+    monkeypatch.setenv("ACM_MEMORY_FILE", str(path))
     monkeypatch.setattr(cli, "ClaudeCLI", EchoLLM)
     monkeypatch.setattr(cli.sys, "stdin", FakeStdin("exit\n"))
     monkeypatch.setattr(cli.sys.stdout, "reconfigure", lambda **kwargs: None, raising=False)
     return path
 
 
-def test_main_reports_restored_history(main_env, capsys):
+def test_main_reports_loaded_memories(main_env, capsys):
     main_env.write_text(
-        '{"role": "user", "content": "やあ"}\n{"role": "assistant", "content": "どうも"}\n',
+        '{"text": "ユーザーの名前はテスト太郎", "origin": "user", '
+        '"evidence": "私の名前はテスト太郎です"}\n',
         encoding="utf-8",
     )
 
     assert cli.main() == 0
-    assert "前回までの会話を読み込みました（2 件）" in capsys.readouterr().out
+    assert "長期記憶を読み込みました（1 件）" in capsys.readouterr().out
 
 
-def test_main_exits_with_error_on_broken_history_file(main_env, capsys):
+def test_main_does_not_read_back_saved_conversation(main_env, capsys):
+    # 原文ファイルは読み戻さないので、壊れていても起動できる
+    (main_env.parent / "conversation.jsonl").write_text("壊れた行\n", encoding="utf-8")
+
+    assert cli.main() == 0
+    assert "チャットを開始します" in capsys.readouterr().out
+
+
+def test_main_exits_with_error_on_broken_memory_file(main_env, capsys):
     main_env.write_text("壊れた行\n", encoding="utf-8")
 
     assert cli.main() == 1

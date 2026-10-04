@@ -16,7 +16,7 @@ class FakeLLM:
         self.replies = list(replies)
         self.calls = []
 
-    def complete(self, messages):
+    def complete(self, messages, memories=()):
         self.calls.append([dict(m) for m in messages])
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
@@ -117,34 +117,23 @@ def test_failed_turn_is_not_saved(path):
     assert not path.exists()
 
 
-def test_history_is_restored_after_restart(path):
-    """再起動相当: 保存 → 新しいChatSessionを生成 → 同じファイルから復元。"""
+def test_saved_history_is_kept_but_not_restored_after_restart(path):
+    """再起動相当: 保存 → 新しいChatSessionを生成。原文は残るが、会話履歴としては戻さない（MVP3）。"""
     first = ChatSession(FakeLLM(["テスト太郎さん、はじめまして。"]), path)
     first.send("私の名前はテスト太郎です")
     del first
 
-    llm = FakeLLM(["テスト太郎さんです。"])
+    llm = FakeLLM(["分かりません。"])
     second = ChatSession(llm, path)
 
-    assert second.messages == TURN
+    assert second.messages == []
 
     second.send("前回私が名乗った名前は？")
 
-    # 復元した履歴も含めて、全履歴がLLMへ渡される
-    assert llm.calls[0] == TURN + [{"role": "user", "content": "前回私が名乗った名前は？"}]
-    # 再起動後のターンは既存の履歴の後ろへ追記される
+    # 再起動前の会話はLLMへ渡されない
+    assert llm.calls[0] == [{"role": "user", "content": "前回私が名乗った名前は？"}]
+    # 再起動後のターンは既存の原文の後ろへ追記される
     assert load_history(path) == TURN + [
         {"role": "user", "content": "前回私が名乗った名前は？"},
-        {"role": "assistant", "content": "テスト太郎さんです。"},
+        {"role": "assistant", "content": "分かりません。"},
     ]
-
-
-def test_session_with_broken_history_file_fails_to_start(path):
-    path.parent.mkdir()
-    path.write_text("壊れた行\n", encoding="utf-8")
-
-    with pytest.raises(HistoryError):
-        ChatSession(FakeLLM([]), path)
-
-    # 壊れたファイルには手を加えない
-    assert path.read_text(encoding="utf-8") == "壊れた行\n"

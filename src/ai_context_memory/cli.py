@@ -7,11 +7,13 @@ from pathlib import Path
 from .chat import ChatSession
 from .history import HistoryError
 from .llm import ClaudeCLI, LLMError
+from .memory import MemoryStoreError
 
 EXIT_COMMANDS = {"exit", "quit"}
 
 # 起動時のカレントディレクトリからの相対パス。data/ はGit管理対象外
 DEFAULT_HISTORY_FILE = Path("data") / "conversation.jsonl"
+DEFAULT_MEMORY_FILE = Path("data") / "memories.jsonl"
 
 
 def run(session, input_fn=input, output_fn=print):
@@ -43,6 +45,17 @@ def run(session, input_fn=input, output_fn=print):
             continue
         output_fn(f"\nAI> {reply}")
 
+        # 記憶抽出は会話本体より優先度が低いので、失敗しても警告だけで続行する
+        try:
+            saved, warnings = session.remember(user_text)
+        except KeyboardInterrupt:
+            output_fn("\n[記憶抽出を中断しました]")
+            continue
+        for memory in saved:
+            output_fn(f"[記憶] {memory['text']}")
+        for warning in warnings:
+            output_fn(f"[警告] {warning}")
+
     output_fn("終了します。")
 
 
@@ -52,12 +65,13 @@ def main():
     sys.stdin.reconfigure(encoding="utf-8-sig")
     sys.stdout.reconfigure(encoding="utf-8")
     history_path = Path(os.environ.get("ACM_HISTORY_FILE") or DEFAULT_HISTORY_FILE)
+    memory_path = Path(os.environ.get("ACM_MEMORY_FILE") or DEFAULT_MEMORY_FILE)
     try:
-        session = ChatSession(ClaudeCLI(), history_path)
-    except HistoryError as e:
+        session = ChatSession(ClaudeCLI(), history_path, memory_path)
+    except MemoryStoreError as e:
         print(f"[エラー] {e}")
         return 1
-    if session.messages:
-        print(f"前回までの会話を読み込みました（{len(session.messages)} 件）。")
+    if session.memories:
+        print(f"長期記憶を読み込みました（{len(session.memories)} 件）。")
     run(session)
     return 0

@@ -67,6 +67,49 @@ def test_whole_history_is_sent_on_stdin(fake_run):
     )
 
 
+def test_memories_are_sent_as_a_separate_block_before_the_conversation(fake_run):
+    memories = [
+        {"text": "ユーザーの名前はテスト太郎", "origin": "user", "evidence": "私の名前はテスト太郎です"},
+        {"text": "今回の試験対象はAとB", "origin": "user", "evidence": "今回の試験対象はAとBです"},
+    ]
+
+    ClaudeCLI().complete([{"role": "user", "content": "私の名前は？"}], memories)
+
+    assert fake_run.kwargs["input"] == (
+        "[long-term memory]\n"
+        "- ユーザーの名前はテスト太郎\n"
+        "- 今回の試験対象はAとB\n"
+        "[/long-term memory]\n\n"
+        "[user]\n私の名前は？"
+    )
+    command = fake_run.command
+    assert command[command.index("--system-prompt") + 1] == llm.SYSTEM_PROMPT
+    assert "[long-term memory]" in llm.SYSTEM_PROMPT
+
+
+def test_extract_memories_sends_only_the_user_text_with_extraction_prompt(fake_run, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    fake_run.result = completed(result="[]")
+
+    assert ClaudeCLI().extract_memories("私の名前はテスト太郎です") == "[]"
+
+    command = fake_run.command
+    assert fake_run.kwargs["input"] == "私の名前はテスト太郎です"
+    assert command[command.index("--system-prompt") + 1] == llm.EXTRACTION_SYSTEM_PROMPT
+    # 通常回答と同じ原則: 非対話・ツール無効・セッション非永続・APIキーを渡さない
+    assert "-p" in command
+    assert command[command.index("--tools") + 1] == ""
+    assert "--no-session-persistence" in command
+    assert "ANTHROPIC_API_KEY" not in fake_run.kwargs["env"]
+
+
+def test_extract_memories_failure_becomes_llm_error(fake_run):
+    fake_run.result = completed(is_error=True, result="API Error: 529 Overloaded")
+
+    with pytest.raises(LLMError, match="529 Overloaded"):
+        ClaudeCLI().extract_memories("やあ")
+
+
 def test_api_billing_env_vars_are_not_passed_to_claude(fake_run, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
