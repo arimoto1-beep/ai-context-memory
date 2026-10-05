@@ -21,17 +21,21 @@ NAME_EXTRACTION = extraction({"text": "ユーザーの名前はテスト太郎",
 
 
 class FakeLLM:
-    """通常回答と記憶抽出の呼び出しを別々に記録し、用意された応答を順に返す。"""
+    """通常回答・記憶抽出・検索プラン作成の呼び出しを別々に記録し、用意された応答を順に返す。"""
 
-    def __init__(self, replies, extractions=()):
+    def __init__(self, replies, extractions=(), plans=()):
         self.replies = list(replies)
         self.extractions = list(extractions)
+        self.plans = list(plans)  # 尽きたら「記憶は不要」を返す
         self.prompts = []  # 通常回答でclaudeへ渡されるプロンプト
         self.extract_calls = []  # 記憶抽出の入力
 
     def complete(self, messages, memories=()):
         self.prompts.append(format_prompt(messages, memories))
         return self.replies.pop(0)
+
+    def plan_search(self, user_text, previous_queries=()):
+        return self.plans.pop(0) if self.plans else '{"needs_memory": false, "queries": []}'
 
     def extract_memories(self, user_text):
         self.extract_calls.append(user_text)
@@ -47,8 +51,9 @@ def paths(tmp_path):
 
 
 def turn(session, user_text):
-    """CLIの1ターンと同じ順序: 通常回答のあとに記憶抽出。"""
-    reply = session.send(user_text)
+    """CLIの1ターンと同じ順序: 記憶の検索、通常回答、記憶抽出。"""
+    found, _, _ = session.recall(user_text)
+    reply = session.send(user_text, found)
     saved, warnings = session.remember(user_text)
     return reply, saved, warnings
 
@@ -315,7 +320,7 @@ def test_after_restart_memories_are_sent_but_old_conversation_is_not(paths):
     turn(first, NAME_TEXT)
     del first
 
-    llm = FakeLLM(["テスト太郎さんです。"], ["[]"])
+    llm = FakeLLM(["テスト太郎さんです。"], ["[]"], ['{"needs_memory": true, "queries": ["名前"]}'])
     second = ChatSession(llm, history_path, memory_path)
 
     assert second.messages == []
@@ -324,13 +329,15 @@ def test_after_restart_memories_are_sent_but_old_conversation_is_not(paths):
     turn(second, "私の名前は？")
 
     prompt = llm.prompts[0]
-    # 古い会話全文（ユーザー原文・assistant応答）は通常回答用プロンプトに含まれない
-    assert NAME_TEXT not in prompt
+    # 古い会話（ユーザー発言・assistant応答）は会話履歴として通常回答用プロンプトに含まれない
+    assert f"[user]\n{NAME_TEXT}" not in prompt
     assert first_reply not in prompt
     assert "[assistant]" not in prompt
-    # 長期記憶は別枠で含まれる
+    # 検索でヒットした記憶は別枠で含まれる（過去の発言は根拠として付くだけ）
     assert prompt == (
-        "[long-term memory]\n- ユーザーの名前はテスト太郎\n[/long-term memory]\n\n"
+        "[retrieved memories]\n"
+        "- ユーザーの名前はテスト太郎 (origin: user, evidence: 私の名前はテスト太郎です)\n"
+        "[/retrieved memories]\n\n"
         "[user]\n私の名前は？"
     )
     # 原文は証拠として残り、再起動後のターンも追記される
@@ -352,8 +359,8 @@ def test_conversation_in_current_process_is_still_kept(paths):
     turn(session, "今回の試験対象はAとBです")
     turn(session, "今回の試験対象は？")
 
+    # 検索にヒットしていない保存済みの記憶は渡らず、現在の会話はすべて渡る
     assert llm.prompts[1] == (
-        "[long-term memory]\n- ユーザーの名前はテスト太郎\n[/long-term memory]\n\n"
         "[user]\n今回の試験対象はAとBです\n\n"
         "[assistant]\n了解しました\n\n"
         "[user]\n今回の試験対象は？"

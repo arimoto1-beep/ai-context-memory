@@ -76,15 +76,15 @@ def test_memories_are_sent_as_a_separate_block_before_the_conversation(fake_run)
     ClaudeCLI().complete([{"role": "user", "content": "私の名前は？"}], memories)
 
     assert fake_run.kwargs["input"] == (
-        "[long-term memory]\n"
-        "- ユーザーの名前はテスト太郎\n"
-        "- 今回の試験対象はAとB\n"
-        "[/long-term memory]\n\n"
+        "[retrieved memories]\n"
+        "- ユーザーの名前はテスト太郎 (origin: user, evidence: 私の名前はテスト太郎です)\n"
+        "- 今回の試験対象はAとB (origin: user, evidence: 今回の試験対象はAとBです)\n"
+        "[/retrieved memories]\n\n"
         "[user]\n私の名前は？"
     )
     command = fake_run.command
     assert command[command.index("--system-prompt") + 1] == llm.SYSTEM_PROMPT
-    assert "[long-term memory]" in llm.SYSTEM_PROMPT
+    assert "[retrieved memories]" in llm.SYSTEM_PROMPT
 
 
 def test_extract_memories_sends_only_the_user_text_with_extraction_prompt(fake_run, monkeypatch):
@@ -101,6 +101,34 @@ def test_extract_memories_sends_only_the_user_text_with_extraction_prompt(fake_r
     assert command[command.index("--tools") + 1] == ""
     assert "--no-session-persistence" in command
     assert "ANTHROPIC_API_KEY" not in fake_run.kwargs["env"]
+
+
+def test_plan_search_sends_only_the_question_with_search_plan_prompt(fake_run, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    plan = '{"needs_memory": true, "queries": ["名前"]}'
+    fake_run.result = completed(result=plan)
+
+    assert ClaudeCLI().plan_search("私の名前は？") == plan
+
+    command = fake_run.command
+    assert fake_run.kwargs["input"] == "[question]\n私の名前は？"
+    assert command[command.index("--system-prompt") + 1] == llm.SEARCH_PLAN_SYSTEM_PROMPT
+    # 通常回答と同じ原則: 非対話・ツール無効・セッション非永続・APIキーを渡さない
+    assert "-p" in command
+    assert command[command.index("--tools") + 1] == ""
+    assert "--no-session-persistence" in command
+    assert "ANTHROPIC_API_KEY" not in fake_run.kwargs["env"]
+
+
+def test_plan_search_retry_sends_question_and_failed_queries_only(fake_run):
+    fake_run.result = completed(result='{"needs_memory": true, "queries": ["スタッドレス"]}')
+
+    ClaudeCLI().plan_search("冬用のタイヤ、何インチ？", ["冬用タイヤ", "タイヤ サイズ"])
+
+    assert fake_run.kwargs["input"] == (
+        "[question]\n冬用のタイヤ、何インチ？\n\n"
+        "[previous queries: 0 hits]\n- 冬用タイヤ\n- タイヤ サイズ"
+    )
 
 
 def test_extract_memories_failure_becomes_llm_error(fake_run):

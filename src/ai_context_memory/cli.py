@@ -31,7 +31,14 @@ def run(session, input_fn=input, output_fn=print):
             break
 
         try:
-            reply = session.send(user_text)
+            # 検索は会話本体より優先度が低いので、失敗しても警告だけで記憶なしの回答へ進む
+            found, search_log, warnings = session.recall(user_text)
+            for number, (queries, count) in enumerate(search_log):
+                output_fn(f"[{'再検索' if number else '検索'}] {' / '.join(queries)}")
+                output_fn(f"[検索結果] {count}件")
+            for warning in warnings:
+                output_fn(f"[警告] {warning}")
+            reply = session.send(user_text, found)
         except LLMError as e:
             output_fn(f"[エラー] {e}")
             continue

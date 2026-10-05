@@ -61,14 +61,18 @@ def append_memories(path, memories):
         raise MemoryStoreError(f"記憶を保存できませんでした: {path} ({e})") from e
 
 
-def parse_candidates(raw):
-    """抽出AIの出力を記憶候補のリストとして解析する。JSON配列でなければ失敗とする。"""
+def strip_code_fence(raw):
+    """AIの出力からコードブロックの囲みを外す。JSONだけを返すよう指示していても付けてくることがある。"""
     text = raw.strip()
-    # JSONだけを返すよう指示していても、コードブロックで囲んで返すことがある
     if text.startswith("```"):
         text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+    return text
+
+
+def parse_candidates(raw):
+    """抽出AIの出力を記憶候補のリストとして解析する。JSON配列でなければ失敗とする。"""
     try:
-        candidates = json.loads(text)
+        candidates = json.loads(strip_code_fence(raw))
     except json.JSONDecodeError as e:
         raise MemoryStoreError(f"抽出結果がJSONとして読めません ({e.msg})") from e
     if not isinstance(candidates, list):

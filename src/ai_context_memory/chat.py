@@ -10,13 +10,14 @@ from .memory import (
     parse_candidates,
     rejection_reason,
 )
+from .search import MAX_ROUNDS, SearchPlanError, normalize, parse_search_plan, search_memories
 
 
 class ChatSession:
     def __init__(self, llm, history_path=None, memory_path=None):
         """history_path へは会話原文を追記するだけで、読み戻さない。
 
-        memory_path を渡すと、保存済みの長期記憶を読み込んでLLMへ渡す。
+        memory_path を渡すと、保存済みの長期記憶を検索対象として読み込む。
         """
         self.llm = llm
         self.history_path = history_path
@@ -25,11 +26,39 @@ class ChatSession:
         self.messages = []
         self.memories = load_memories(memory_path) if memory_path else []
 
-    def send(self, user_text):
-        """ユーザー発話を履歴に追加し、現在の会話と長期記憶をLLMへ渡して応答を返す。"""
+    def recall(self, user_text):
+        """ユーザー発話に関係しそうな長期記憶を検索し、(ヒットした記憶, 検索ログ, 警告メッセージ) を返す。
+
+        検索語はLLMに考えさせ、検索と回数の制御はここで行う。
+        検索ログは検索を実行したラウンドごとの (検索語のリスト, ヒット件数)。
+        失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
+        """
+        log = []
+        if not self.memories:
+            return [], log, []
+        tried = []
+        for _ in range(MAX_ROUNDS):
+            try:
+                queries = parse_search_plan(self.llm.plan_search(user_text, tried))
+            except (LLMError, SearchPlanError) as e:
+                return [], log, [f"記憶を検索できませんでした: {e}"]
+            used = {normalize(q) for q in tried}
+            queries = [q for q in queries if normalize(q) not in used]
+            if not queries:
+                # 記憶は不要という判断か、使用済みの検索語しか出てこなかった
+                break
+            found = search_memories(self.memories, queries)
+            log.append((queries, len(found)))
+            if found:
+                return found, log, []
+            tried += queries
+        return [], log, []
+
+    def send(self, user_text, memories=()):
+        """ユーザー発話を履歴に追加し、現在の会話と memories（recall の結果）だけをLLMへ渡して応答を返す。"""
         self.messages.append({"role": "user", "content": user_text})
         try:
-            reply = self.llm.complete(self.messages, self.memories)
+            reply = self.llm.complete(self.messages, memories)
         except Exception:
             # 失敗した発話を残すとuserが連続するため、履歴を元に戻す
             self.messages.pop()
