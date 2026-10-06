@@ -10,12 +10,12 @@ from ai_context_memory.llm import LLMError
 
 
 class EchoLLM:
-    def complete(self, messages, memories=()):
+    def complete(self, messages, memories=(), working_memory=None):
         return f"echo: {messages[-1]['content']}"
 
 
 class FailingLLM:
-    def complete(self, messages, memories=()):
+    def complete(self, messages, memories=(), working_memory=None):
         raise LLMError("接続できません")
 
 
@@ -126,6 +126,7 @@ def main_env(tmp_path, monkeypatch):
     path = tmp_path / "memories.jsonl"
     monkeypatch.setenv("ACM_HISTORY_FILE", str(tmp_path / "conversation.jsonl"))
     monkeypatch.setenv("ACM_MEMORY_FILE", str(path))
+    monkeypatch.setenv("ACM_WORKING_MEMORY_FILE", str(tmp_path / "working_memory.json"))
     monkeypatch.setattr(cli, "ClaudeCLI", EchoLLM)
     monkeypatch.setattr(cli.sys, "stdin", FakeStdin("exit\n"))
     monkeypatch.setattr(cli.sys.stdout, "reconfigure", lambda **kwargs: None, raising=False)
@@ -158,4 +159,25 @@ def test_main_exits_with_error_on_broken_memory_file(main_env, capsys):
     out = capsys.readouterr().out
     assert "[エラー]" in out
     assert "1 行目" in out
+    assert "チャットを開始します" not in out
+
+
+def test_main_reports_loaded_working_memory(main_env, capsys):
+    (main_env.parent / "working_memory.json").write_text(
+        '{"scope": [{"text": "商用環境", "evidence": "商用環境"}, '
+        '{"text": "検証環境", "evidence": "検証環境"}], '
+        '"acceptance_criteria": [{"text": "全環境で動けば完了", "evidence": "全環境で動けば完了"}]}',
+        encoding="utf-8",
+    )
+
+    assert cli.main() == 0
+    assert "作業記憶を読み込みました（3項目）" in capsys.readouterr().out
+
+
+def test_main_exits_with_error_on_broken_working_memory_file(main_env, capsys):
+    (main_env.parent / "working_memory.json").write_text("壊れた内容", encoding="utf-8")
+
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "[エラー] 作業記憶ファイル" in out
     assert "チャットを開始します" not in out

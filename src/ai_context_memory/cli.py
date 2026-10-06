@@ -8,12 +8,14 @@ from .chat import ChatSession
 from .history import HistoryError
 from .llm import ClaudeCLI, LLMError
 from .memory import MemoryStoreError
+from .working_memory import WorkingMemoryError, count_items
 
 EXIT_COMMANDS = {"exit", "quit"}
 
 # 起動時のカレントディレクトリからの相対パス。data/ はGit管理対象外
 DEFAULT_HISTORY_FILE = Path("data") / "conversation.jsonl"
 DEFAULT_MEMORY_FILE = Path("data") / "memories.jsonl"
+DEFAULT_WORKING_MEMORY_FILE = Path("data") / "working_memory.json"
 
 
 def run(session, input_fn=input, output_fn=print):
@@ -63,7 +65,30 @@ def run(session, input_fn=input, output_fn=print):
         for warning in warnings:
             output_fn(f"[警告] {warning}")
 
+        # 作業記憶の抽出も同様に、失敗しても警告だけで続行する
+        try:
+            changes, warnings = session.update_working_memory(user_text)
+        except KeyboardInterrupt:
+            output_fn("\n[作業記憶の抽出を中断しました]")
+            continue
+        for line in format_working_memory_changes(changes):
+            output_fn(f"[作業記憶] {line}")
+        for warning in warnings:
+            output_fn(f"[警告] {warning}")
+
     output_fn("終了します。")
+
+
+def format_working_memory_changes(changes):
+    """作業記憶の変更を表示用の行にする。追加はフィールドごとに1行、置き換えは1件ごとに1行。"""
+    added = {}
+    lines = []
+    for change in changes:
+        if change["replaced"] is None:
+            added.setdefault(change["field"], []).append(change["text"])
+        else:
+            lines.append(f"{change['field']}: {change['replaced']} → {change['text']}")
+    return [f"{field}: {' / '.join(texts)}" for field, texts in added.items()] + lines
 
 
 def main():
@@ -73,12 +98,17 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8")
     history_path = Path(os.environ.get("ACM_HISTORY_FILE") or DEFAULT_HISTORY_FILE)
     memory_path = Path(os.environ.get("ACM_MEMORY_FILE") or DEFAULT_MEMORY_FILE)
+    working_memory_path = Path(
+        os.environ.get("ACM_WORKING_MEMORY_FILE") or DEFAULT_WORKING_MEMORY_FILE
+    )
     try:
-        session = ChatSession(ClaudeCLI(), history_path, memory_path)
-    except MemoryStoreError as e:
+        session = ChatSession(ClaudeCLI(), history_path, memory_path, working_memory_path)
+    except (MemoryStoreError, WorkingMemoryError) as e:
         print(f"[エラー] {e}")
         return 1
     if session.memories:
         print(f"長期記憶を読み込みました（{len(session.memories)} 件）。")
+    if count_items(session.working_memory):
+        print(f"作業記憶を読み込みました（{count_items(session.working_memory)}項目）。")
     run(session)
     return 0

@@ -209,3 +209,62 @@ def test_non_json_output_becomes_llm_error(fake_run):
 
     with pytest.raises(LLMError, match="取得できませんでした"):
         ClaudeCLI().complete(HISTORY)
+
+
+def test_working_memory_is_sent_before_memories_and_conversation(fake_run):
+    working_memory = {
+        "mission": [],
+        "scope": [{"text": "商用環境", "evidence": "商用環境"}, {"text": "検証環境", "evidence": "検証環境"}],
+        "acceptance_criteria": [{"text": "全環境で動けば完了", "evidence": "全環境で動けば完了"}],
+    }
+    memories = [{"text": "ユーザーの名前はテスト太郎", "origin": "user", "evidence": "私の名前はテスト太郎です"}]
+
+    ClaudeCLI().complete([{"role": "user", "content": "完成ですか？"}], memories, working_memory)
+
+    # 項目の無いフィールド（mission）は見出しごと省く
+    assert fake_run.kwargs["input"].split("\n") == [
+        "[working memory]",
+        "Scope:",
+        "- 商用環境",
+        "- 検証環境",
+        "",
+        "Acceptance Criteria:",
+        "- 全環境で動けば完了",
+        "[/working memory]",
+        "",
+        "[retrieved memories]",
+        "- ユーザーの名前はテスト太郎 (origin: user, evidence: 私の名前はテスト太郎です)",
+        "[/retrieved memories]",
+        "",
+        "[user]",
+        "完成ですか？",
+    ]
+
+
+def test_extract_working_memory_sends_current_state_and_utterance_only(fake_run, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    fake_run.result = completed(result="[]")
+    working_memory = {
+        "mission": [],
+        "scope": [{"text": "商用環境", "evidence": "商用環境"}],
+        "acceptance_criteria": [],
+    }
+
+    assert ClaudeCLI().extract_working_memory("検証環境も対象にします", working_memory) == "[]"
+
+    command = fake_run.command
+    assert fake_run.kwargs["input"].split("\n") == [
+        "[working memory]",
+        "Scope:",
+        "- 商用環境",
+        "[/working memory]",
+        "",
+        "[utterance]",
+        "検証環境も対象にします",
+    ]
+    assert command[command.index("--system-prompt") + 1] == llm.WORKING_MEMORY_SYSTEM_PROMPT
+    # 通常回答と同じ原則: 非対話・ツール無効・セッション非永続・APIキーを渡さない
+    assert "-p" in command
+    assert command[command.index("--tools") + 1] == ""
+    assert "--no-session-persistence" in command
+    assert "ANTHROPIC_API_KEY" not in fake_run.kwargs["env"]

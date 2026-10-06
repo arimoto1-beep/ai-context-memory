@@ -1,4 +1,4 @@
-"""会話。現在のプロセス内の履歴はメモリ上に保持し、会話原文と長期記憶をファイルへ保存する。"""
+"""会話。現在のプロセス内の履歴はメモリ上に保持し、会話原文・長期記憶・作業記憶をファイルへ保存する。"""
 
 from .history import HistoryError, append_history
 from .llm import LLMError
@@ -11,20 +11,35 @@ from .memory import (
     rejection_reason,
 )
 from .search import MAX_ROUNDS, SearchPlanError, normalize, parse_search_plan, search_memories
+from .working_memory import (
+    WorkingMemoryError,
+    apply_candidates,
+    empty_working_memory,
+    load_working_memory,
+    save_working_memory,
+)
+from .working_memory import parse_candidates as parse_working_memory_candidates
 
 
 class ChatSession:
-    def __init__(self, llm, history_path=None, memory_path=None):
+    def __init__(self, llm, history_path=None, memory_path=None, working_memory_path=None):
         """history_path へは会話原文を追記するだけで、読み戻さない。
 
         memory_path を渡すと、保存済みの長期記憶を検索対象として読み込む。
+        working_memory_path を渡すと、保存済みの作業記憶を読み込み、毎回LLMへ渡す。
         """
         self.llm = llm
         self.history_path = history_path
         self.memory_path = memory_path
+        self.working_memory_path = working_memory_path
         # 今回の起動からの会話だけ。再起動前の会話はここへ戻さない
         self.messages = []
         self.memories = load_memories(memory_path) if memory_path else []
+        self.working_memory = (
+            load_working_memory(working_memory_path)
+            if working_memory_path
+            else empty_working_memory()
+        )
 
     def recall(self, user_text):
         """ユーザー発話に関係しそうな長期記憶を検索し、(ヒットした記憶, 検索ログ, 警告メッセージ) を返す。
@@ -55,10 +70,13 @@ class ChatSession:
         return [], log, []
 
     def send(self, user_text, memories=()):
-        """ユーザー発話を履歴に追加し、現在の会話と memories（recall の結果）だけをLLMへ渡して応答を返す。"""
+        """ユーザー発話を履歴に追加し、LLMへ渡して応答を返す。
+
+        渡すのは作業記憶（常に全項目）、memories（recall の結果）、現在の会話だけ。
+        """
         self.messages.append({"role": "user", "content": user_text})
         try:
-            reply = self.llm.complete(self.messages, memories)
+            reply = self.llm.complete(self.messages, memories, self.working_memory)
         except Exception:
             # 失敗した発話を残すとuserが連続するため、履歴を元に戻す
             self.messages.pop()
@@ -110,3 +128,28 @@ class ChatSession:
                 return [], warnings + [str(e)]
             self.memories.extend(accepted)
         return accepted, warnings
+
+    def update_working_memory(self, user_text):
+        """ユーザー発話から作業記憶の候補を提案させ、検証して反映し、(変更のリスト, 警告メッセージ) を返す。
+
+        抽出の入力は現在の作業記憶とユーザー発話だけで、assistantの発言は渡さない。
+        LLMは候補を提案するだけで、採用の判断と状態の書き換えはここで行う。
+        失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
+        """
+        if not self.working_memory_path:
+            return [], []
+        try:
+            candidates = parse_working_memory_candidates(
+                self.llm.extract_working_memory(user_text, self.working_memory)
+            )
+        except (LLMError, WorkingMemoryError) as e:
+            return [], [f"作業記憶を抽出できませんでした: {e}"]
+
+        updated, changes, warnings = apply_candidates(self.working_memory, candidates, user_text)
+        if changes:
+            try:
+                save_working_memory(self.working_memory_path, updated)
+            except WorkingMemoryError as e:
+                return [], warnings + [str(e)]
+            self.working_memory = updated
+        return changes, warnings
