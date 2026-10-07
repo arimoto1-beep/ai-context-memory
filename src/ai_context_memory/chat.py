@@ -13,6 +13,7 @@ from .memory import (
 from .search import MAX_ROUNDS, SearchPlanError, normalize, parse_search_plan, search_memories
 from .working_memory import (
     WorkingMemoryError,
+    append_working_memory_history,
     apply_candidates,
     empty_working_memory,
     load_working_memory,
@@ -22,16 +23,25 @@ from .working_memory import parse_candidates as parse_working_memory_candidates
 
 
 class ChatSession:
-    def __init__(self, llm, history_path=None, memory_path=None, working_memory_path=None):
+    def __init__(
+        self,
+        llm,
+        history_path=None,
+        memory_path=None,
+        working_memory_path=None,
+        working_memory_history_path=None,
+    ):
         """history_path へは会話原文を追記するだけで、読み戻さない。
 
         memory_path を渡すと、保存済みの長期記憶を検索対象として読み込む。
         working_memory_path を渡すと、保存済みの作業記憶を読み込み、毎回LLMへ渡す。
+        working_memory_history_path へは作業記憶の変更履歴を追記するだけで、読み戻さない。
         """
         self.llm = llm
         self.history_path = history_path
         self.memory_path = memory_path
         self.working_memory_path = working_memory_path
+        self.working_memory_history_path = working_memory_history_path
         # 今回の起動からの会話だけ。再起動前の会話はここへ戻さない
         self.messages = []
         self.memories = load_memories(memory_path) if memory_path else []
@@ -133,7 +143,8 @@ class ChatSession:
         """ユーザー発話から作業記憶の候補を提案させ、検証して反映し、(変更のリスト, 警告メッセージ) を返す。
 
         抽出の入力は現在の作業記憶とユーザー発話だけで、assistantの発言は渡さない。
-        LLMは候補を提案するだけで、採用の判断と状態の書き換えはここで行う。
+        LLMは候補（add / replace / remove）を提案するだけで、採用の判断と状態の書き換えはここで行う。
+        現在状態を保存してから変更履歴を追記する。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
         """
         if not self.working_memory_path:
@@ -152,4 +163,10 @@ class ChatSession:
             except WorkingMemoryError as e:
                 return [], warnings + [str(e)]
             self.working_memory = updated
+            if self.working_memory_history_path:
+                try:
+                    append_working_memory_history(self.working_memory_history_path, changes)
+                except WorkingMemoryError as e:
+                    # 現在状態は保存できているので、変更は有効なまま警告だけ返す
+                    warnings.append(str(e))
         return changes, warnings

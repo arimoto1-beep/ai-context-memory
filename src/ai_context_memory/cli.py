@@ -8,7 +8,7 @@ from .chat import ChatSession
 from .history import HistoryError
 from .llm import ClaudeCLI, LLMError
 from .memory import MemoryStoreError
-from .working_memory import WorkingMemoryError, count_items
+from .working_memory import OP_ADD, OP_REMOVE, WorkingMemoryError, count_items
 
 EXIT_COMMANDS = {"exit", "quit"}
 
@@ -16,6 +16,7 @@ EXIT_COMMANDS = {"exit", "quit"}
 DEFAULT_HISTORY_FILE = Path("data") / "conversation.jsonl"
 DEFAULT_MEMORY_FILE = Path("data") / "memories.jsonl"
 DEFAULT_WORKING_MEMORY_FILE = Path("data") / "working_memory.json"
+DEFAULT_WORKING_MEMORY_HISTORY_FILE = Path("data") / "working_memory_history.jsonl"
 
 
 def run(session, input_fn=input, output_fn=print):
@@ -80,14 +81,16 @@ def run(session, input_fn=input, output_fn=print):
 
 
 def format_working_memory_changes(changes):
-    """作業記憶の変更を表示用の行にする。追加はフィールドごとに1行、置き換えは1件ごとに1行。"""
+    """作業記憶の変更を表示用の行にする。追加はフィールドごとに1行、置き換え・削除は1件ごとに1行。"""
     added = {}
     lines = []
     for change in changes:
-        if change["replaced"] is None:
+        if change["operation"] == OP_ADD:
             added.setdefault(change["field"], []).append(change["text"])
+        elif change["operation"] == OP_REMOVE:
+            lines.append(f"{change['field']}: {change['text']} → 削除")
         else:
-            lines.append(f"{change['field']}: {change['replaced']} → {change['text']}")
+            lines.append(f"{change['field']}: {change['target']} → {change['text']}")
     return [f"{field}: {' / '.join(texts)}" for field, texts in added.items()] + lines
 
 
@@ -101,8 +104,13 @@ def main():
     working_memory_path = Path(
         os.environ.get("ACM_WORKING_MEMORY_FILE") or DEFAULT_WORKING_MEMORY_FILE
     )
+    working_memory_history_path = Path(
+        os.environ.get("ACM_WORKING_MEMORY_HISTORY_FILE") or DEFAULT_WORKING_MEMORY_HISTORY_FILE
+    )
     try:
-        session = ChatSession(ClaudeCLI(), history_path, memory_path, working_memory_path)
+        session = ChatSession(
+            ClaudeCLI(), history_path, memory_path, working_memory_path, working_memory_history_path
+        )
     except (MemoryStoreError, WorkingMemoryError) as e:
         print(f"[エラー] {e}")
         return 1

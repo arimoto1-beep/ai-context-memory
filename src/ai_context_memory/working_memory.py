@@ -1,10 +1,12 @@
 """作業記憶（Working Memory）。現在進行中の作業で忘れてはいけない情報を、1つのJSONファイルに保存する。
 
 長期記憶と違って検索せず、回答のたびに全項目をLLMへ渡す。
-何を入れるかの判断はAIに任せ、ここではAIが提案した候補の検証と状態の書き換えだけを行う。
+何を入れるか・何を消すかの判断はAIに任せ、ここではAIが提案した候補の検証と状態の書き換えだけを行う。
+現在状態（working_memory.json）とは別に、変更履歴を JSONL へ追記する。履歴は回答用のLLMへは渡さない。
 """
 
 import json
+from datetime import datetime
 
 from .memory import strip_code_fence
 from .search import normalize
@@ -15,6 +17,12 @@ FIELDS = {
     "scope": "Scope",
     "acceptance_criteria": "Acceptance Criteria",
 }
+
+# 作業記憶に対する状態変更
+OP_ADD = "add"
+OP_REPLACE = "replace"
+OP_REMOVE = "remove"
+OPERATIONS = (OP_ADD, OP_REPLACE, OP_REMOVE)
 
 
 class WorkingMemoryError(Exception):
@@ -97,28 +105,52 @@ def _same(a, b):
     return normalize(" ".join(a.split())) == normalize(" ".join(b.split()))
 
 
+def normalize_candidate(candidate):
+    """候補を operation 付きの形にそろえる。
+
+    MVP5 形式（operation なし）は、replaces があれば replace（replaces を target とする）、なければ add とみなす。
+    """
+    if not isinstance(candidate, dict) or "operation" in candidate:
+        return candidate
+    if candidate.get("replaces") is None:
+        return {**candidate, "operation": OP_ADD}
+    normalized = {k: v for k, v in candidate.items() if k != "replaces"}
+    return {**normalized, "operation": OP_REPLACE, "target": candidate["replaces"]}
+
+
+def _matching_indexes(items, target):
+    return [i for i, item in enumerate(items) if _same(item["text"], target)]
+
+
 def rejection_reason(candidate, user_text, working_memory):
-    """候補を採用してよければ None、採用できなければその理由を返す。"""
+    """候補を採用してよければ None、採用できなければその理由を返す。candidate は normalize_candidate 済みとする。"""
     if not isinstance(candidate, dict):
         return "形式が不正です"
+    operation = candidate.get("operation")
     field = candidate.get("field")
     text = candidate.get("text")
+    target = candidate.get("target")
     evidence = candidate.get("evidence")
-    replaces = candidate.get("replaces")
+    if operation not in OPERATIONS:
+        return f"operation が不正です: {operation}"
     if field not in FIELDS:
         return f"field が不正です: {field}"
-    if not isinstance(text, str) or not text.strip():
+    if operation != OP_REMOVE and (not isinstance(text, str) or not text.strip()):
         return "text がありません"
     if not isinstance(evidence, str) or not evidence.strip():
         return "evidence がありません"
     # AIが根拠を作り出していないことを、元の発言との照合で確かめる
     if evidence not in user_text:
         return f"evidence が元の発言に含まれていません: {evidence}"
-    if replaces is not None:
-        if not isinstance(replaces, str) or not any(
-            _same(item["text"], replaces) for item in working_memory[field]
-        ):
-            return f"replaces が {field} の既存の項目と一致しません: {replaces}"
+    if operation != OP_ADD:
+        if not isinstance(target, str) or not target.strip():
+            return "target がありません"
+        # 部分一致や似た項目では変更しない。AIが書いた target は既存の文面と一致したときだけ使う
+        matches = _matching_indexes(working_memory[field], target)
+        if not matches:
+            return f"target が {field} の既存の項目と一致しません: {target}"
+        if len(matches) > 1:
+            return f"target が {field} の複数の項目と一致するため特定できません: {target}"
     return None
 
 
@@ -126,28 +158,70 @@ def apply_candidates(working_memory, candidates, user_text):
     """候補を検証して作業記憶へ反映し、(新しい作業記憶, 変更のリスト, 警告メッセージ) を返す。
 
     元の working_memory は書き換えない。
-    変更は {"field", "text", "replaced"} で、replaced は置き換えた項目の文面（追加なら None）。
+    変更は履歴に残すイベントと同じ形で、operation / field / text / evidence と、replace のときだけ target を持つ。
+    text は add なら追加した項目、replace なら置き換え後の項目、remove なら削除した項目の文面。
     """
     updated = {field: list(items) for field, items in working_memory.items()}
     changes = []
     warnings = []
     for candidate in candidates:
+        candidate = normalize_candidate(candidate)
         reason = rejection_reason(candidate, user_text, updated)
         if reason:
             warnings.append(f"作業記憶の候補を保存しませんでした: {reason}")
             continue
+        operation = candidate["operation"]
         field = candidate["field"]
-        text = candidate["text"].strip()
+        evidence = candidate["evidence"]
         items = updated[field]
+        if operation == OP_REMOVE:
+            [index] = _matching_indexes(items, candidate["target"])
+            removed = items.pop(index)
+            changes.append(
+                {"operation": operation, "field": field, "text": removed["text"], "evidence": evidence}
+            )
+            continue
+        text = candidate["text"].strip()
         if any(_same(item["text"], text) for item in items):
             continue
-        item = {"text": text, "evidence": candidate["evidence"]}
-        replaces = candidate.get("replaces")
-        if replaces is None:
+        item = {"text": text, "evidence": evidence}
+        if operation == OP_ADD:
             items.append(item)
-            changes.append({"field": field, "text": text, "replaced": None})
+            changes.append({"operation": operation, "field": field, "text": text, "evidence": evidence})
         else:
-            index = next(i for i, old in enumerate(items) if _same(old["text"], replaces))
-            changes.append({"field": field, "text": text, "replaced": items[index]["text"]})
+            [index] = _matching_indexes(items, candidate["target"])
+            changes.append(
+                {
+                    "operation": operation,
+                    "field": field,
+                    "target": items[index]["text"],
+                    "text": text,
+                    "evidence": evidence,
+                }
+            )
             items[index] = item
     return updated, changes, warnings
+
+
+def append_working_memory_history(path, changes, now=None):
+    """作業記憶の変更を、1行1イベントで履歴ファイルへ追記する。現在状態とは別に、消した項目も残すため。"""
+    timestamp = (now or datetime.now().astimezone()).isoformat(timespec="seconds")
+    lines = "".join(
+        json.dumps({"timestamp": timestamp, **change}, ensure_ascii=False) + "\n"
+        for change in changes
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(lines)
+    except OSError as e:
+        raise WorkingMemoryError(f"作業記憶の変更履歴を保存できませんでした: {path} ({e})") from e
+
+
+def load_working_memory_history(path):
+    """履歴ファイルを読み込む（確認・テスト用）。回答用のLLMへは渡さない。"""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []

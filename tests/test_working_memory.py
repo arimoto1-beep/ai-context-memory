@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -14,10 +15,14 @@ from ai_context_memory.llm import (
 from ai_context_memory.memory import append_memories, load_memories
 from ai_context_memory.working_memory import (
     WorkingMemoryError,
+    append_working_memory_history,
     apply_candidates,
     count_items,
     empty_working_memory,
     load_working_memory,
+    load_working_memory_history,
+    normalize_candidate,
+    parse_candidates,
     save_working_memory,
 )
 
@@ -103,7 +108,12 @@ class FakeLLM:
 @pytest.fixture
 def paths(tmp_path):
     data = tmp_path / "data"
-    return data / "conversation.jsonl", data / "memories.jsonl", data / "working_memory.json"
+    return (
+        data / "conversation.jsonl",
+        data / "memories.jsonl",
+        data / "working_memory.json",
+        data / "working_memory_history.jsonl",
+    )
 
 
 def run_cli(session, inputs):
@@ -195,7 +205,7 @@ def test_candidate_is_saved_to_its_field(paths, field):
     session.send(f"今回は{text}ところまでやります")
     changes, warnings = session.update_working_memory(f"今回は{text}ところまでやります")
 
-    assert changes == [{"field": field, "text": text, "replaced": None}]
+    assert changes == [{"operation": "add", "field": field, "text": text, "evidence": text}]
     assert warnings == []
     expected = empty_working_memory()
     expected[field] = [item(text)]
@@ -530,3 +540,469 @@ def test_empty_working_memory_adds_no_block(paths):
 def test_system_prompt_explains_working_memory():
     assert "[working memory]" in llm_module.SYSTEM_PROMPT
     assert "継続的に守る必要がある条件" in llm_module.SYSTEM_PROMPT
+
+
+# --- MVP6: remove と変更履歴 ---
+
+THREE_ENVS_TEXT = "今回の作業では商用環境、検証環境、開発環境の3環境を対象にします。3環境すべて対応できれば完了です。"
+SWAP_TEXT = "検証環境の代わりにステージング環境を対象にします。"
+DROP_TEXT = "ステージング環境はやっぱり対象外にします。"
+DROP_EVIDENCE = "ステージング環境はやっぱり対象外にします"
+
+PROD = "商用環境を対象とする"
+VERIFY = "検証環境を対象とする"
+STAGING = "ステージング環境を対象とする"
+DEV = "開発環境を対象とする"
+ALL_DONE = "3環境すべてに対応できていること"
+
+
+def add(field, text, evidence=None):
+    return {"operation": "add", "field": field, "text": text, "evidence": evidence or text}
+
+
+def replace(field, target, text, evidence):
+    return {"operation": "replace", "field": field, "target": target, "text": text, "evidence": evidence}
+
+
+def remove(field, target, evidence=DROP_EVIDENCE):
+    return {"operation": "remove", "field": field, "target": target, "evidence": evidence}
+
+
+def staging_working_memory():
+    """MVP5 の実Claudeテストで問題が出たときの、remove 直前の状態。"""
+    return {
+        "mission": [],
+        "scope": [item(PROD, "商用環境"), item(STAGING, "ステージング環境"), item(DEV, "開発環境")],
+        "acceptance_criteria": [item(ALL_DONE, "3環境すべて対応できれば完了です")],
+    }
+
+
+def scope_texts(working_memory):
+    return [i["text"] for i in working_memory["scope"]]
+
+
+def without_timestamp(events):
+    return [{k: v for k, v in e.items() if k != "timestamp"} for e in events]
+
+
+def test_remove_candidate_can_be_parsed():
+    """1. remove 候補を解析できる。"""
+    raw = "```json\n" + extraction(remove("scope", STAGING)) + "\n```"
+
+    [parsed] = parse_candidates(raw)
+
+    assert normalize_candidate(parsed) == {
+        "operation": "remove",
+        "field": "scope",
+        "target": STAGING,
+        "evidence": DROP_EVIDENCE,
+    }
+
+
+def test_mvp5_candidates_are_normalized_to_add_and_replace():
+    assert normalize_candidate(candidate("scope", PROD)) == add("scope", PROD)
+    assert normalize_candidate(candidate("scope", STAGING, "ステージング", replaces=VERIFY)) == (
+        replace("scope", VERIFY, STAGING, "ステージング")
+    )
+
+
+def test_existing_scope_item_is_removed_and_others_remain(paths):
+    """2〜4. 実在する scope 項目を remove でき、ファイルから消え、他の項目は残る。"""
+    save_working_memory(paths[2], staging_working_memory())
+    llm = FakeLLM(["承知しました。"], [extraction(remove("scope", STAGING))])
+    session = ChatSession(llm, *paths)
+
+    outputs = run_cli(session, [DROP_TEXT, "exit"])
+
+    saved = load_working_memory(paths[2])
+    assert saved["scope"] == [item(PROD, "商用環境"), item(DEV, "開発環境")]
+    assert "ステージング" not in paths[2].read_text(encoding="utf-8")
+    assert session.working_memory == saved
+    # 完了条件は連動して書き換えない
+    assert saved["acceptance_criteria"] == staging_working_memory()["acceptance_criteria"]
+    assert [o for o in outputs if o.startswith("[作業記憶]")] == [
+        f"[作業記憶] scope: {STAGING} → 削除"
+    ]
+    assert not any(o.startswith("[警告]") for o in outputs)
+
+
+@pytest.mark.parametrize(
+    "bad, reason",
+    [
+        # 5. evidence が今回の発言に無い
+        (remove("scope", STAGING, "ステージング環境は不要です"), "evidence"),
+        # 6. target が存在しない
+        (remove("scope", "災害対策環境を対象とする"), "一致しません"),
+        # 7. field が違う（scope にある項目を acceptance_criteria から消そうとする）
+        (remove("acceptance_criteria", STAGING), "一致しません"),
+        (remove("progress", STAGING), "field"),
+        # 8. 曖昧な target（部分一致）では消さない
+        (remove("scope", "ステージング環境"), "一致しません"),
+        (remove("scope", "環境"), "一致しません"),
+        (remove("scope", "ステージング環境を対象"), "一致しません"),
+        # target が無い・operation が不正
+        ({"operation": "remove", "field": "scope", "evidence": DROP_EVIDENCE}, "target"),
+        (remove("scope", ""), "target"),
+        ({**remove("scope", STAGING), "operation": "delete"}, "operation"),
+    ],
+)
+def test_invalid_remove_is_rejected_and_nothing_is_removed(bad, reason):
+    updated, changes, warnings = apply_candidates(staging_working_memory(), [bad], DROP_TEXT)
+
+    assert updated == staging_working_memory()
+    assert changes == []
+    assert len(warnings) == 1 and reason in warnings[0]
+
+
+def test_ambiguous_target_matching_several_items_is_not_removed():
+    """8. 同じ文面とみなせる項目が複数あれば、どれを消すか特定できないので消さない。"""
+    working_memory = staging_working_memory()
+    # 手で編集すると、表記だけが違う項目が重なることがある
+    working_memory["scope"].append(item(" ステージング環境を対象とする "))
+
+    updated, changes, warnings = apply_candidates(
+        working_memory, [remove("scope", STAGING)], DROP_TEXT
+    )
+
+    assert updated == working_memory
+    assert changes == []
+    assert "特定できません" in warnings[0]
+
+
+def test_remove_ignores_case_width_and_spaces_like_duplicate_check():
+    working_memory = empty_working_memory()
+    working_memory["scope"] = [item("ＡＷＳ環境を対象とする"), item(DEV)]
+
+    updated, changes, _ = apply_candidates(
+        working_memory,
+        [remove("scope", " aws環境を対象とする ", "AWS環境は外します")],
+        "AWS環境は外します",
+    )
+
+    assert updated["scope"] == [item(DEV)]
+    # 履歴には実際に消した項目の文面を残す
+    assert changes == [
+        {
+            "operation": "remove",
+            "field": "scope",
+            "text": "ＡＷＳ環境を対象とする",
+            "evidence": "AWS環境は外します",
+        }
+    ]
+
+
+def test_remove_does_not_use_text():
+    """remove に text が付いていても、否定文を追加も置き換えもしない。"""
+    updated, changes, warnings = apply_candidates(
+        staging_working_memory(),
+        [{**remove("scope", STAGING), "text": "ステージング環境は対象外とする"}],
+        DROP_TEXT,
+    )
+
+    assert scope_texts(updated) == [PROD, DEV]
+    assert changes[0]["text"] == STAGING
+    assert warnings == []
+
+
+def test_same_item_cannot_be_removed_twice_in_one_turn():
+    updated, changes, warnings = apply_candidates(
+        staging_working_memory(), [remove("scope", STAGING), remove("scope", STAGING)], DROP_TEXT
+    )
+
+    assert scope_texts(updated) == [PROD, DEV]
+    assert len(changes) == 1
+    assert len(warnings) == 1
+
+
+def test_remove_and_add_in_one_turn_are_applied_in_order():
+    text = "ステージング環境は対象外にして、本番DR環境を対象にします"
+    updated, changes, warnings = apply_candidates(
+        staging_working_memory(),
+        [
+            remove("scope", STAGING, "ステージング環境は対象外にして"),
+            add("scope", "本番DR環境を対象とする", "本番DR環境を対象にします"),
+        ],
+        text,
+    )
+
+    assert scope_texts(updated) == [PROD, DEV, "本番DR環境を対象とする"]
+    assert [c["operation"] for c in changes] == ["remove", "add"]
+    assert warnings == []
+
+
+def test_add_replace_remove_events_are_written_to_history(paths):
+    """9〜11. add / replace / remove のイベントが履歴へ保存される（手動スモークテストの流れ）。"""
+    llm = FakeLLM(
+        ["承知しました。", "承知しました。", "承知しました。"],
+        [
+            extraction(
+                add("scope", PROD, "商用環境"),
+                add("scope", VERIFY, "検証環境"),
+                add("scope", DEV, "開発環境"),
+                add("acceptance_criteria", ALL_DONE, "3環境すべて対応できれば完了です"),
+            ),
+            extraction(
+                replace("scope", VERIFY, STAGING, "検証環境の代わりにステージング環境を対象にします")
+            ),
+            extraction(remove("scope", STAGING)),
+        ],
+    )
+    session = ChatSession(llm, *paths)
+
+    outputs = run_cli(session, [THREE_ENVS_TEXT, SWAP_TEXT, DROP_TEXT, "exit"])
+
+    assert [o for o in outputs if o.startswith("[作業記憶]")] == [
+        f"[作業記憶] scope: {PROD} / {VERIFY} / {DEV}",
+        f"[作業記憶] acceptance_criteria: {ALL_DONE}",
+        f"[作業記憶] scope: {VERIFY} → {STAGING}",
+        f"[作業記憶] scope: {STAGING} → 削除",
+    ]
+    # 現在状態からは消える
+    saved = load_working_memory(paths[2])
+    assert scope_texts(saved) == [PROD, DEV]
+    assert [i["text"] for i in saved["acceptance_criteria"]] == [ALL_DONE]
+    # 履歴には「以前存在した」ことと「後から消した」ことが残る
+    history = load_working_memory_history(paths[3])
+    assert without_timestamp(history) == [
+        {"operation": "add", "field": "scope", "text": PROD, "evidence": "商用環境"},
+        {"operation": "add", "field": "scope", "text": VERIFY, "evidence": "検証環境"},
+        {"operation": "add", "field": "scope", "text": DEV, "evidence": "開発環境"},
+        {
+            "operation": "add",
+            "field": "acceptance_criteria",
+            "text": ALL_DONE,
+            "evidence": "3環境すべて対応できれば完了です",
+        },
+        {
+            "operation": "replace",
+            "field": "scope",
+            "target": VERIFY,
+            "text": STAGING,
+            "evidence": "検証環境の代わりにステージング環境を対象にします",
+        },
+        {"operation": "remove", "field": "scope", "text": STAGING, "evidence": DROP_EVIDENCE},
+    ]
+    assert all(isinstance(e["timestamp"], str) and e["timestamp"] for e in history)
+
+
+def test_history_is_one_json_object_per_line_and_append_only(paths):
+    now = datetime(2026, 10, 7, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+    removal = {"operation": "remove", "field": "scope", "text": PROD, "evidence": "外す"}
+
+    append_working_memory_history(paths[3], [add("scope", PROD)], now=now)
+    append_working_memory_history(paths[3], [removal], now=now)
+
+    lines = paths[3].read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {"timestamp": "2026-10-07T10:00:00+09:00", **add("scope", PROD)},
+        {"timestamp": "2026-10-07T10:00:00+09:00", **removal},
+    ]
+
+
+def test_nothing_is_written_to_history_when_nothing_changes(paths):
+    save_working_memory(paths[2], staging_working_memory())
+    llm = FakeLLM(["はい", "はい"], [extraction(remove("scope", "存在しない項目")), "[]"])
+    session = ChatSession(llm, *paths)
+
+    run_cli(session, [DROP_TEXT, "今日は眠い", "exit"])
+
+    assert not paths[3].exists()
+    assert load_working_memory(paths[2]) == staging_working_memory()
+
+
+def test_removed_state_is_read_after_restart(paths):
+    """12. 再起動後も remove 後の現在状態を読む。"""
+    save_working_memory(paths[2], staging_working_memory())
+    first = ChatSession(FakeLLM(["承知しました。"], [extraction(remove("scope", STAGING))]), *paths)
+    run_cli(first, [DROP_TEXT, "exit"])
+    del first
+
+    llm = FakeLLM(["商用環境と開発環境です。"])
+    second = ChatSession(llm, *paths)
+    run_cli(second, ["この作業の対象環境は？", "exit"])
+
+    assert scope_texts(second.working_memory) == [PROD, DEV]
+    assert llm.prompts == [
+        "[working memory]\n"
+        f"Scope:\n- {PROD}\n- {DEV}\n\n"
+        f"Acceptance Criteria:\n- {ALL_DONE}\n"
+        "[/working memory]\n\n"
+        "[user]\nこの作業の対象環境は？"
+    ]
+
+
+def test_removed_item_and_history_are_not_sent_to_answering_claude(paths):
+    """13〜14. 削除済みの項目も履歴全文も、回答用の Claude へ渡さない。"""
+    save_working_memory(paths[2], staging_working_memory())
+    llm = FakeLLM(
+        ["承知しました。", "商用環境と開発環境です。"], [extraction(remove("scope", STAGING))]
+    )
+    session = ChatSession(llm, *paths)
+
+    run_cli(session, [DROP_TEXT, "この作業の対象環境は？", "exit"])
+
+    assert load_working_memory_history(paths[3])  # 履歴はある
+    prompt = llm.prompts[1]
+    block = prompt.split("[/working memory]")[0]
+    assert STAGING not in block
+    assert PROD in block and DEV in block
+    # 履歴のイベントは入らない。ステージングが出てくるのは、今回の起動中の会話としてだけ
+    assert '"operation"' not in prompt
+    assert "remove" not in prompt
+    assert "timestamp" not in prompt
+    assert prompt.count("ステージング") == prompt.count(DROP_TEXT) == 1
+
+
+def test_working_memory_wins_over_old_long_term_memory(paths):
+    """15. 長期記憶の検索が古い情報を返しても、現在の作業記憶を優先する指示が入っている。"""
+    old = {
+        "text": "作業の対象はステージング環境を含む",
+        "origin": "user",
+        "evidence": "検証環境の代わりにステージング環境を対象にします",
+    }
+    append_memories(paths[1], [old])
+    working_memory = staging_working_memory()
+    del working_memory["scope"][1]
+    save_working_memory(paths[2], working_memory)
+    llm = FakeLLM(["商用環境と開発環境です。"], plans=[plan("ステージング")])
+    session = ChatSession(llm, *paths)
+
+    run_cli(session, ["この作業の対象環境は？ステージングは入ってる？", "exit"])
+
+    # 古い長期記憶は検索結果としてそのまま渡る（MVP4 の挙動は変えない）
+    prompt = llm.prompts[0]
+    assert "[retrieved memories]\n- 作業の対象はステージング環境を含む" in prompt
+    assert STAGING not in prompt.split("[/working memory]")[0]
+    # その上で、作業記憶を現在の状態として優先させる
+    system = llm_module.SYSTEM_PROMPT
+    assert "現在有効な作業状態" in system
+    assert (
+        "取得した記憶と [working memory] が矛盾する場合は、[working memory] を現在の状態として優先"
+        in system
+    )
+    assert "不整合を具体的に指摘" in system
+
+
+@pytest.mark.parametrize(
+    "bad_extraction",
+    [
+        '[{"operation": "remove", "field": "scope", "target": "ステージ',
+        '{"operation": "remove", "field": "scope", "target": "ステージング環境を対象とする"}',
+        extraction(remove("scope", "ステージング環境")),
+        LLMError("接続できません"),
+    ],
+)
+def test_broken_or_failed_remove_does_not_stop_conversation(paths, bad_extraction):
+    """16. 不正JSONや remove 失敗で通常会話を止めない。"""
+    save_working_memory(paths[2], staging_working_memory())
+    llm = FakeLLM(["承知しました。", "二回目の応答"], [bad_extraction, "[]"])
+    session = ChatSession(llm, *paths)
+
+    outputs = run_cli(session, [DROP_TEXT, "続けます", "exit"])
+
+    assert "\nAI> 承知しました。" in outputs
+    assert any(o.startswith("[警告]") for o in outputs)
+    assert "\nAI> 二回目の応答" in outputs
+    assert outputs[-1] == "終了します。"
+    assert load_working_memory(paths[2]) == staging_working_memory()
+    assert not paths[3].exists()
+
+
+def test_history_save_failure_is_a_warning_and_state_change_is_kept(tmp_path):
+    # 親が通常ファイルなのでディレクトリを作れず、履歴の保存に失敗する
+    blocker = tmp_path / "blocked"
+    blocker.write_text("", encoding="utf-8")
+    working_path = tmp_path / "working_memory.json"
+    save_working_memory(working_path, staging_working_memory())
+    llm = FakeLLM(["承知しました。", "二回目の応答"], [extraction(remove("scope", STAGING))])
+    session = ChatSession(
+        llm,
+        tmp_path / "conversation.jsonl",
+        tmp_path / "memories.jsonl",
+        working_path,
+        blocker / "working_memory_history.jsonl",
+    )
+
+    outputs = run_cli(session, [DROP_TEXT, "続けます", "exit"])
+
+    assert f"[作業記憶] scope: {STAGING} → 削除" in outputs
+    assert any(o.startswith("[警告] 作業記憶の変更履歴を保存できませんでした") for o in outputs)
+    assert "\nAI> 二回目の応答" in outputs
+    assert scope_texts(load_working_memory(working_path)) == [PROD, DEV]
+
+
+def test_state_save_failure_writes_no_history(tmp_path):
+    blocker = tmp_path / "blocked"
+    blocker.write_text("", encoding="utf-8")
+    history_path = tmp_path / "working_memory_history.jsonl"
+    llm = FakeLLM(["承知しました。"], [extraction(add("scope", PROD, "商用環境"))])
+    session = ChatSession(
+        llm,
+        tmp_path / "conversation.jsonl",
+        tmp_path / "memories.jsonl",
+        blocker / "working_memory.json",
+        history_path,
+    )
+
+    outputs = run_cli(session, ["商用環境を対象にします", "exit"])
+
+    assert any(o.startswith("[警告] 作業記憶を保存できませんでした") for o in outputs)
+    assert not history_path.exists()
+
+
+def test_mvp5_add_and_replace_still_work_in_both_formats(paths):
+    """17. MVP5 の add / replace（operation なしの形式を含む）が引き続き動く。"""
+    llm = FakeLLM(
+        ["はい", "はい", "はい"],
+        [
+            extraction(candidate("scope", PROD, "商用環境"), add("scope", VERIFY, "検証環境")),
+            extraction(candidate("scope", STAGING, "ステージング環境", replaces=VERIFY)),
+            extraction(replace("scope", STAGING, "本番DR環境を対象とする", "本番DR環境")),
+        ],
+    )
+    session = ChatSession(llm, *paths)
+
+    outputs = run_cli(
+        session,
+        [
+            "商用環境と検証環境を対象にします",
+            "検証環境ではなくステージング環境にします",
+            "やはり本番DR環境にします",
+            "exit",
+        ],
+    )
+
+    assert scope_texts(load_working_memory(paths[2])) == [PROD, "本番DR環境を対象とする"]
+    assert [o for o in outputs if o.startswith("[作業記憶]")] == [
+        f"[作業記憶] scope: {PROD} / {VERIFY}",
+        f"[作業記憶] scope: {VERIFY} → {STAGING}",
+        f"[作業記憶] scope: {STAGING} → 本番DR環境を対象とする",
+    ]
+    assert [e["operation"] for e in load_working_memory_history(paths[3])] == [
+        "add",
+        "add",
+        "replace",
+        "replace",
+    ]
+
+
+def test_mvp4_search_still_works_with_working_memory_history(paths):
+    """18. MVP4 の検索が引き続き動く。"""
+    append_memories(paths[1], [NAME, FRUIT])
+    save_working_memory(paths[2], staging_working_memory())
+    llm = FakeLLM(["テスト太郎さんです。"], plans=[plan("血液型"), plan("名前")])
+    session = ChatSession(llm, *paths)
+
+    outputs = run_cli(session, ["私の名前は？", "exit"])
+
+    assert outputs[1:5] == ["[検索] 血液型", "[検索結果] 0件", "[再検索] 名前", "[検索結果] 1件"]
+    assert f"[retrieved memories]\n{NAME_LINE}\n[/retrieved memories]" in llm.prompts[0]
+
+
+def test_extraction_prompt_asks_for_remove_instead_of_negative_items():
+    prompt = llm_module.WORKING_MEMORY_SYSTEM_PROMPT
+    for word in ("operation", "add", "replace", "remove", "target"):
+        assert word in prompt
+    assert "対象外にする・不要にする・外すという発言は remove" in prompt
+    assert "否定の内容を add" in prompt
+    assert "推測で変更しないでください" in prompt
