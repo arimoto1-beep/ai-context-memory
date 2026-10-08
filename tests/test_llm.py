@@ -268,3 +268,68 @@ def test_extract_working_memory_sends_current_state_and_utterance_only(fake_run,
     assert command[command.index("--tools") + 1] == ""
     assert "--no-session-persistence" in command
     assert "ANTHROPIC_API_KEY" not in fake_run.kwargs["env"]
+
+
+def test_plan_search_sends_current_working_memory_before_the_question(fake_run):
+    fake_run.result = completed(result='{"needs_memory": false, "queries": []}')
+    working_memory = {
+        "mission": [],
+        "scope": [{"text": "商用環境", "evidence": "商用環境"}],
+        "acceptance_criteria": [],
+    }
+
+    ClaudeCLI().plan_search("この作業の対象環境は？", working_memory=working_memory)
+
+    assert fake_run.kwargs["input"].split("\n") == [
+        "[working memory]",
+        "Scope:",
+        "- 商用環境",
+        "[/working memory]",
+        "",
+        "[question]",
+        "この作業の対象環境は？",
+    ]
+
+
+def test_working_memory_history_is_sent_between_working_memory_and_memories(fake_run):
+    working_memory = {
+        "mission": [],
+        "scope": [{"text": "商用環境", "evidence": "商用環境"}],
+        "acceptance_criteria": [],
+    }
+    memories = [{"text": "ユーザーの名前はテスト太郎", "origin": "user", "evidence": "私の名前はテスト太郎です"}]
+    events = [
+        {
+            "timestamp": "2026-10-07T18:48:45+09:00",
+            "operation": "remove",
+            "field": "scope",
+            "text": "ステージング環境",
+            "evidence": "ステージング環境はやっぱり対象外にします。",
+        }
+    ]
+
+    ClaudeCLI().complete(
+        [{"role": "user", "content": "いつ外した？"}], memories, working_memory, events
+    )
+
+    assert fake_run.kwargs["input"].split("\n") == [
+        "[working memory]",
+        "Scope:",
+        "- 商用環境",
+        "[/working memory]",
+        "",
+        "[working memory history]",
+        "- 2026-10-07T18:48:45+09:00",
+        "  operation: remove",
+        "  field: scope",
+        "  text: ステージング環境",
+        "  evidence: ステージング環境はやっぱり対象外にします。",
+        "[/working memory history]",
+        "",
+        "[retrieved memories]",
+        "- ユーザーの名前はテスト太郎 (origin: user, evidence: 私の名前はテスト太郎です)",
+        "[/retrieved memories]",
+        "",
+        "[user]",
+        "いつ外した？",
+    ]

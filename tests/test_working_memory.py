@@ -86,11 +86,11 @@ class FakeLLM:
         self.working_calls = []  # 作業記憶の抽出の入力
         self.plan_calls = []
 
-    def complete(self, messages, memories=(), working_memory=None):
+    def complete(self, messages, memories=(), working_memory=None, history_events=()):
         self.prompts.append(format_prompt(messages, memories, working_memory))
         return self.replies.pop(0)
 
-    def plan_search(self, user_text, previous_queries=()):
+    def plan_search(self, user_text, previous_queries=(), working_memory=None):
         self.plan_calls.append((user_text, list(previous_queries)))
         return self.plans.pop(0) if self.plans else '{"needs_memory": false, "queries": []}'
 
@@ -395,7 +395,7 @@ def test_save_failure_is_a_warning_and_state_is_unchanged(tmp_path):
 
 def test_no_extraction_when_reply_failed(paths):
     class FailingLLM(FakeLLM):
-        def complete(self, messages, memories=(), working_memory=None):
+        def complete(self, messages, memories=(), working_memory=None, history_events=()):
             raise LLMError("接続できません")
 
     llm = FailingLLM([])

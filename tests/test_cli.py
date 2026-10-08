@@ -10,12 +10,12 @@ from ai_context_memory.llm import LLMError
 
 
 class EchoLLM:
-    def complete(self, messages, memories=(), working_memory=None):
+    def complete(self, messages, memories=(), working_memory=None, history_events=()):
         return f"echo: {messages[-1]['content']}"
 
 
 class FailingLLM:
-    def complete(self, messages, memories=(), working_memory=None):
+    def complete(self, messages, memories=(), working_memory=None, history_events=()):
         raise LLMError("接続できません")
 
 

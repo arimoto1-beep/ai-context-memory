@@ -30,11 +30,11 @@ class FakeLLM:
         self.prompts = []  # 通常回答でclaudeへ渡されるプロンプト
         self.extract_calls = []  # 記憶抽出の入力
 
-    def complete(self, messages, memories=(), working_memory=None):
+    def complete(self, messages, memories=(), working_memory=None, history_events=()):
         self.prompts.append(format_prompt(messages, memories, working_memory))
         return self.replies.pop(0)
 
-    def plan_search(self, user_text, previous_queries=()):
+    def plan_search(self, user_text, previous_queries=(), working_memory=None):
         return self.plans.pop(0) if self.plans else '{"needs_memory": false, "queries": []}'
 
     def extract_memories(self, user_text):
@@ -296,7 +296,7 @@ def test_no_extraction_when_reply_failed_or_on_exit(paths):
     history_path, memory_path = paths
 
     class FailingLLM(FakeLLM):
-        def complete(self, messages, memories=(), working_memory=None):
+        def complete(self, messages, memories=(), working_memory=None, history_events=()):
             raise LLMError("接続できません")
 
     llm = FailingLLM([])

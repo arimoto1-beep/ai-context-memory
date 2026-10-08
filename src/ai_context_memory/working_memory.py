@@ -2,7 +2,8 @@
 
 長期記憶と違って検索せず、回答のたびに全項目をLLMへ渡す。
 何を入れるか・何を消すかの判断はAIに任せ、ここではAIが提案した候補の検証と状態の書き換えだけを行う。
-現在状態（working_memory.json）とは別に、変更履歴を JSONL へ追記する。履歴は回答用のLLMへは渡さない。
+現在状態（working_memory.json）とは別に、変更履歴を JSONL へ追記する。
+履歴は毎回は渡さず、AIが必要と判断したときだけ検索して、ヒットしたイベントをLLMへ渡す（検索は search.py）。
 """
 
 import json
@@ -219,9 +220,31 @@ def append_working_memory_history(path, changes, now=None):
 
 
 def load_working_memory_history(path):
-    """履歴ファイルを読み込む（確認・テスト用）。回答用のLLMへは渡さない。"""
+    """履歴ファイルを全イベント読み込む。ファイルが無ければ空のリストを返す。
+
+    回答用のLLMへは、ここから検索でヒットしたイベントだけを渡す。
+    """
     try:
         with open(path, encoding="utf-8-sig") as f:
-            return [json.loads(line) for line in f if line.strip()]
+            lines = f.read().splitlines()
     except FileNotFoundError:
         return []
+    except (OSError, UnicodeDecodeError) as e:
+        raise WorkingMemoryError(f"作業記憶の変更履歴を読み込めませんでした: {path} ({e})") from e
+
+    events = []
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise WorkingMemoryError(
+                f"作業記憶の変更履歴がJSONとして読めません: {path} ({number} 行目: {e.msg})"
+            ) from e
+        if not isinstance(event, dict):
+            raise WorkingMemoryError(
+                f"作業記憶の変更履歴の形式が不正です: {path} ({number} 行目: JSONオブジェクトが必要です)"
+            )
+        events.append(event)
+    return events

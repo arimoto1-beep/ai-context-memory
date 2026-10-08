@@ -1,5 +1,7 @@
 """会話。現在のプロセス内の履歴はメモリ上に保持し、会話原文・長期記憶・作業記憶をファイルへ保存する。"""
 
+from typing import NamedTuple
+
 from .history import HistoryError, append_history
 from .llm import LLMError
 from .memory import (
@@ -10,16 +12,34 @@ from .memory import (
     parse_candidates,
     rejection_reason,
 )
-from .search import MAX_ROUNDS, SearchPlanError, normalize, parse_search_plan, search_memories
+from .search import (
+    MAX_ROUNDS,
+    SearchPlanError,
+    normalize,
+    parse_plan,
+    search_memories,
+    search_working_memory_history,
+)
 from .working_memory import (
     WorkingMemoryError,
     append_working_memory_history,
     apply_candidates,
     empty_working_memory,
     load_working_memory,
+    load_working_memory_history,
     save_working_memory,
 )
 from .working_memory import parse_candidates as parse_working_memory_candidates
+
+
+class Retrieval(NamedTuple):
+    """1ターン分の検索結果。検索ログは、検索を実行した回ごとの (検索語のリスト, ヒット件数)。"""
+
+    memories: list  # ヒットした長期記憶
+    search_log: list  # 長期記憶の検索ログ
+    history_events: list  # ヒットした作業記憶の変更履歴（古い順）
+    history_log: list  # 変更履歴の検索ログ。検索しなかったターンは空
+    warnings: list
 
 
 class ChatSession:
@@ -35,7 +55,7 @@ class ChatSession:
 
         memory_path を渡すと、保存済みの長期記憶を検索対象として読み込む。
         working_memory_path を渡すと、保存済みの作業記憶を読み込み、毎回LLMへ渡す。
-        working_memory_history_path へは作業記憶の変更履歴を追記するだけで、読み戻さない。
+        working_memory_history_path へは作業記憶の変更履歴を追記し、検索が必要なターンで読み込む。
         """
         self.llm = llm
         self.history_path = history_path
@@ -51,42 +71,61 @@ class ChatSession:
             else empty_working_memory()
         )
 
-    def recall(self, user_text):
-        """ユーザー発話に関係しそうな長期記憶を検索し、(ヒットした記憶, 検索ログ, 警告メッセージ) を返す。
+    def retrieve(self, user_text):
+        """ユーザー発話に答えるために必要な長期記憶と作業記憶の変更履歴を検索し、Retrieval を返す。
 
-        検索語はLLMに考えさせ、検索と回数の制御はここで行う。
-        検索ログは検索を実行したラウンドごとの (検索語のリスト, ヒット件数)。
+        どちらを検索するかと検索語はLLMに1回の検索プランで考えさせ、検索と回数の制御はここで行う。
+        発話の意味はここでは解釈しない。
+        長期記憶は0件なら1回だけ検索語を変えて再検索する。変更履歴の検索は1回だけ。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
         """
-        log = []
-        if not self.memories:
-            return [], log, []
-        tried = []
-        for _ in range(MAX_ROUNDS):
+        result = Retrieval([], [], [], [], [])
+        events = []
+        if self.working_memory_history_path:
             try:
-                queries = parse_search_plan(self.llm.plan_search(user_text, tried))
+                events = load_working_memory_history(self.working_memory_history_path)
+            except WorkingMemoryError as e:
+                result.warnings.append(str(e))
+        if not self.memories and not events:
+            # 検索できるものが無い
+            return result
+        tried = []
+        for round_number in range(MAX_ROUNDS):
+            try:
+                plan = parse_plan(self.llm.plan_search(user_text, tried, self.working_memory))
             except (LLMError, SearchPlanError) as e:
-                return [], log, [f"記憶を検索できませんでした: {e}"]
+                result.warnings.append(f"記憶を検索できませんでした: {e}")
+                break
+            if round_number == 0 and plan.history_queries:
+                found = search_working_memory_history(events, plan.history_queries)
+                result.history_events.extend(found)
+                result.history_log.append((plan.history_queries, len(found)))
             used = {normalize(q) for q in tried}
-            queries = [q for q in queries if normalize(q) not in used]
-            if not queries:
-                # 記憶は不要という判断か、使用済みの検索語しか出てこなかった
+            queries = [q for q in plan.queries if normalize(q) not in used]
+            if not queries or not self.memories:
+                # 長期記憶は不要という判断か、使用済みの検索語しか出てこなかったか、検索する長期記憶が無い
                 break
             found = search_memories(self.memories, queries)
-            log.append((queries, len(found)))
+            result.search_log.append((queries, len(found)))
             if found:
-                return found, log, []
+                result.memories.extend(found)
+                break
             tried += queries
-        return [], log, []
+        return result
 
-    def send(self, user_text, memories=()):
+    def recall(self, user_text):
+        """retrieve のうち長期記憶の分だけを、(ヒットした記憶, 検索ログ, 警告メッセージ) で返す。"""
+        result = self.retrieve(user_text)
+        return result.memories, result.search_log, result.warnings
+
+    def send(self, user_text, memories=(), history_events=()):
         """ユーザー発話を履歴に追加し、LLMへ渡して応答を返す。
 
-        渡すのは作業記憶（常に全項目）、memories（recall の結果）、現在の会話だけ。
+        渡すのは作業記憶（常に全項目）、history_events と memories（retrieve の結果）、現在の会話だけ。
         """
         self.messages.append({"role": "user", "content": user_text})
         try:
-            reply = self.llm.complete(self.messages, memories, self.working_memory)
+            reply = self.llm.complete(self.messages, memories, self.working_memory, history_events)
         except Exception:
             # 失敗した発話を残すとuserが連続するため、履歴を元に戻す
             self.messages.pop()
