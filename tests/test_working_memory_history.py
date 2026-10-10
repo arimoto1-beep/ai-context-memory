@@ -139,7 +139,7 @@ class FakeLLM:
         self.prompts = []  # 通常回答でclaudeへ渡されるプロンプト
         self.plan_inputs = []  # 検索プラン作成でclaudeへ渡される入力
 
-    def complete(self, messages, memories=(), working_memory=None, history_events=()):
+    def complete(self, messages, memories=(), working_memory=None, history_events=(), *context):
         self.prompts.append(format_prompt(messages, memories, working_memory, history_events))
         return self.replies.pop(0)
 
@@ -427,7 +427,7 @@ def test_planner_prompt_explains_both_sources():
         "evidence",
     ):
         assert word in prompt
-    assert "[working memory] だけで答えられるので、どちらの検索も不要です" in prompt
+    assert "[working memory] だけで答えられるので、どの検索も不要です" in prompt
 
 
 # --- 質問ごとの使い分け ---

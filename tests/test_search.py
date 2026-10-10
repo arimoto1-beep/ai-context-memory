@@ -45,7 +45,7 @@ class FakeLLM:
         self.plan_calls = []  # 検索プラン作成の入力 (ユーザー発言, 0件だった検索語)
         self.extract_calls = []
 
-    def complete(self, messages, memories=(), working_memory=None, history_events=()):
+    def complete(self, messages, memories=(), working_memory=None, history_events=(), *context):
         self.prompts.append(format_prompt(messages, memories, working_memory))
         return self.replies.pop(0)
 

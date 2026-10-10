@@ -10,12 +10,12 @@ from ai_context_memory.llm import LLMError
 
 
 class EchoLLM:
-    def complete(self, messages, memories=(), working_memory=None, history_events=()):
+    def complete(self, messages, memories=(), working_memory=None, history_events=(), *context):
         return f"echo: {messages[-1]['content']}"
 
 
 class FailingLLM:
-    def complete(self, messages, memories=(), working_memory=None, history_events=()):
+    def complete(self, messages, memories=(), working_memory=None, history_events=(), *context):
         raise LLMError("接続できません")
 
 
@@ -127,6 +127,10 @@ def main_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ACM_HISTORY_FILE", str(tmp_path / "conversation.jsonl"))
     monkeypatch.setenv("ACM_MEMORY_FILE", str(path))
     monkeypatch.setenv("ACM_WORKING_MEMORY_FILE", str(tmp_path / "working_memory.json"))
+    monkeypatch.setenv("ACM_LONG_TERM_MEMORY_STATE_FILE", str(tmp_path / "long_term_memory_state.json"))
+    monkeypatch.setenv(
+        "ACM_LONG_TERM_MEMORY_HISTORY_FILE", str(tmp_path / "long_term_memory_history.jsonl")
+    )
     monkeypatch.setattr(cli, "ClaudeCLI", EchoLLM)
     monkeypatch.setattr(cli.sys, "stdin", FakeStdin("exit\n"))
     monkeypatch.setattr(cli.sys.stdout, "reconfigure", lambda **kwargs: None, raising=False)

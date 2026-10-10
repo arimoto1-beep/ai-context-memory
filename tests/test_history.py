@@ -16,7 +16,7 @@ class FakeLLM:
         self.replies = list(replies)
         self.calls = []
 
-    def complete(self, messages, memories=(), working_memory=None, history_events=()):
+    def complete(self, messages, memories=(), working_memory=None, history_events=(), *context):
         self.calls.append([dict(m) for m in messages])
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):

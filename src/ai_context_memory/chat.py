@@ -1,6 +1,6 @@
 """会話。現在のプロセス内の履歴はメモリ上に保持し、会話原文・長期記憶・作業記憶をファイルへ保存する。"""
 
-from typing import NamedTuple
+from dataclasses import dataclass, field
 
 from .history import HistoryError, append_history
 from .llm import LLMError
@@ -18,8 +18,20 @@ from .search import (
     normalize,
     parse_plan,
     search_memories,
+    search_memory_history,
+    search_memory_state,
     search_working_memory_history,
 )
+from .structured_memory import (
+    StructuredMemoryError,
+    append_memory_history,
+    load_memory_history,
+    load_memory_state,
+    save_memory_state,
+    timestamp_now,
+)
+from .structured_memory import apply_candidates as apply_structured_candidates
+from .structured_memory import parse_candidates as parse_structured_candidates
 from .working_memory import (
     WorkingMemoryError,
     append_working_memory_history,
@@ -32,14 +44,18 @@ from .working_memory import (
 from .working_memory import parse_candidates as parse_working_memory_candidates
 
 
-class Retrieval(NamedTuple):
+@dataclass
+class Retrieval:
     """1ターン分の検索結果。検索ログは、検索を実行した回ごとの (検索語のリスト, ヒット件数)。"""
 
-    memories: list  # ヒットした長期記憶
-    search_log: list  # 長期記憶の検索ログ
-    history_events: list  # ヒットした作業記憶の変更履歴（古い順）
-    history_log: list  # 変更履歴の検索ログ。検索しなかったターンは空
-    warnings: list
+    memories: list = field(default_factory=list)  # ヒットした従来の長期記憶
+    memory_state: list = field(default_factory=list)  # ヒットした構造化した長期記憶の現在値
+    search_log: list = field(default_factory=list)  # 長期記憶の検索ログ。件数は上の2つの合計
+    memory_history_events: list = field(default_factory=list)  # ヒットした長期記憶の変更履歴（古い順）
+    memory_history_log: list = field(default_factory=list)  # 検索しなかったターンは空
+    history_events: list = field(default_factory=list)  # ヒットした作業記憶の変更履歴（古い順）
+    history_log: list = field(default_factory=list)  # 検索しなかったターンは空
+    warnings: list = field(default_factory=list)
 
 
 class ChatSession:
@@ -50,12 +66,16 @@ class ChatSession:
         memory_path=None,
         working_memory_path=None,
         working_memory_history_path=None,
+        memory_state_path=None,
+        memory_history_path=None,
     ):
         """history_path へは会話原文を追記するだけで、読み戻さない。
 
         memory_path を渡すと、保存済みの長期記憶を検索対象として読み込む。
         working_memory_path を渡すと、保存済みの作業記憶を読み込み、毎回LLMへ渡す。
         working_memory_history_path へは作業記憶の変更履歴を追記し、検索が必要なターンで読み込む。
+        memory_state_path を渡すと、構造化した長期記憶の現在値を検索対象として読み込む。
+        memory_history_path へはその変更履歴を追記し、検索が必要なターンで読み込む。
         """
         self.llm = llm
         self.history_path = history_path
@@ -70,23 +90,34 @@ class ChatSession:
             if working_memory_path
             else empty_working_memory()
         )
+        self.memory_state_path = memory_state_path
+        self.memory_history_path = memory_history_path
+        self.memory_state = load_memory_state(memory_state_path) if memory_state_path else []
 
     def retrieve(self, user_text):
-        """ユーザー発話に答えるために必要な長期記憶と作業記憶の変更履歴を検索し、Retrieval を返す。
+        """ユーザー発話に答えるために必要な長期記憶と2つの変更履歴を検索し、Retrieval を返す。
 
-        どちらを検索するかと検索語はLLMに1回の検索プランで考えさせ、検索と回数の制御はここで行う。
+        どれを検索するかと検索語はLLMに1回の検索プランで考えさせ、検索と回数の制御はここで行う。
         発話の意味はここでは解釈しない。
-        長期記憶は0件なら1回だけ検索語を変えて再検索する。変更履歴の検索は1回だけ。
+        長期記憶は、従来の記憶と構造化した現在値を同じ検索語で検索し、
+        どちらも0件なら1回だけ検索語を変えて再検索する。変更履歴の検索はそれぞれ1回だけ。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
         """
-        result = Retrieval([], [], [], [], [])
+        result = Retrieval()
         events = []
         if self.working_memory_history_path:
             try:
                 events = load_working_memory_history(self.working_memory_history_path)
             except WorkingMemoryError as e:
                 result.warnings.append(str(e))
-        if not self.memories and not events:
+        memory_events = []
+        if self.memory_history_path:
+            try:
+                memory_events = load_memory_history(self.memory_history_path)
+            except StructuredMemoryError as e:
+                result.warnings.append(str(e))
+        has_long_term = bool(self.memories or self.memory_state)
+        if not has_long_term and not events and not memory_events:
             # 検索できるものが無い
             return result
         tried = []
@@ -100,32 +131,48 @@ class ChatSession:
                 found = search_working_memory_history(events, plan.history_queries)
                 result.history_events.extend(found)
                 result.history_log.append((plan.history_queries, len(found)))
+            if round_number == 0 and plan.memory_history_queries:
+                found = search_memory_history(memory_events, plan.memory_history_queries)
+                result.memory_history_events.extend(found)
+                result.memory_history_log.append((plan.memory_history_queries, len(found)))
             used = {normalize(q) for q in tried}
             queries = [q for q in plan.queries if normalize(q) not in used]
-            if not queries or not self.memories:
+            if not queries or not has_long_term:
                 # 長期記憶は不要という判断か、使用済みの検索語しか出てこなかったか、検索する長期記憶が無い
                 break
             found = search_memories(self.memories, queries)
-            result.search_log.append((queries, len(found)))
-            if found:
+            found_state = search_memory_state(self.memory_state, queries)
+            result.search_log.append((queries, len(found) + len(found_state)))
+            if found or found_state:
                 result.memories.extend(found)
+                result.memory_state.extend(found_state)
                 break
             tried += queries
         return result
 
     def recall(self, user_text):
-        """retrieve のうち長期記憶の分だけを、(ヒットした記憶, 検索ログ, 警告メッセージ) で返す。"""
+        """retrieve のうち従来の長期記憶の分だけを、(ヒットした記憶, 検索ログ, 警告メッセージ) で返す。"""
         result = self.retrieve(user_text)
         return result.memories, result.search_log, result.warnings
 
-    def send(self, user_text, memories=(), history_events=()):
+    def send(
+        self, user_text, memories=(), history_events=(), memory_state=(), memory_history_events=()
+    ):
         """ユーザー発話を履歴に追加し、LLMへ渡して応答を返す。
 
-        渡すのは作業記憶（常に全項目）、history_events と memories（retrieve の結果）、現在の会話だけ。
+        渡すのは作業記憶（常に全項目）、retrieve の結果（memories / history_events /
+        memory_state / memory_history_events）、現在の会話だけ。
         """
         self.messages.append({"role": "user", "content": user_text})
         try:
-            reply = self.llm.complete(self.messages, memories, self.working_memory, history_events)
+            reply = self.llm.complete(
+                self.messages,
+                memories,
+                self.working_memory,
+                history_events,
+                memory_state,
+                memory_history_events,
+            )
         except Exception:
             # 失敗した発話を残すとuserが連続するため、履歴を元に戻す
             self.messages.pop()
@@ -207,5 +254,41 @@ class ChatSession:
                     append_working_memory_history(self.working_memory_history_path, changes)
                 except WorkingMemoryError as e:
                     # 現在状態は保存できているので、変更は有効なまま警告だけ返す
+                    warnings.append(str(e))
+        return changes, warnings
+
+    def update_memory_state(self, user_text):
+        """ユーザー発話から構造化した長期記憶の候補を提案させ、検証して反映し、(変更のリスト, 警告メッセージ) を返す。
+
+        抽出の入力は現在値（subject / key / value）とユーザー発話だけで、assistantの発言は渡さない。
+        LLMは subject / key / value の候補を提案するだけで、
+        追加・置き換え・変更なしの判定と状態の書き換えはここで行う。
+        現在値を保存してから変更履歴を追記する。
+        失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
+        """
+        if not self.memory_state_path:
+            return [], []
+        try:
+            candidates = parse_structured_candidates(
+                self.llm.extract_structured_memory(user_text, self.memory_state)
+            )
+        except (LLMError, StructuredMemoryError) as e:
+            return [], [f"長期状態を抽出できませんでした: {e}"]
+
+        timestamp = timestamp_now()
+        updated, changes, warnings = apply_structured_candidates(
+            self.memory_state, candidates, user_text, timestamp
+        )
+        if changes:
+            try:
+                save_memory_state(self.memory_state_path, updated)
+            except StructuredMemoryError as e:
+                return [], warnings + [str(e)]
+            self.memory_state = updated
+            if self.memory_history_path:
+                try:
+                    append_memory_history(self.memory_history_path, changes, timestamp)
+                except StructuredMemoryError as e:
+                    # 現在値は保存できているので、変更は有効なまま警告だけ返す
                     warnings.append(str(e))
         return changes, warnings

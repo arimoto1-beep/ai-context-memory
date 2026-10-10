@@ -333,3 +333,89 @@ def test_working_memory_history_is_sent_between_working_memory_and_memories(fake
         "[user]",
         "いつ外した？",
     ]
+
+
+def test_extract_structured_memory_sends_current_keys_and_utterance_only(fake_run, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    fake_run.result = completed(result="[]")
+    items = [
+        {
+            "subject": "user",
+            "key": "favorite_fruit",
+            "value": "梨",
+            "evidence": "私の好きな果物は梨です。",
+            "updated_at": "2026-10-09T10:00:00+09:00",
+        }
+    ]
+
+    assert ClaudeCLI().extract_structured_memory("最近は好きな果物はりんごです。", items) == "[]"
+
+    command = fake_run.command
+    assert fake_run.kwargs["input"].split("\n") == [
+        "[long-term memory state]",
+        "- user.favorite_fruit: 梨",
+        "[/long-term memory state]",
+        "",
+        "[utterance]",
+        "最近は好きな果物はりんごです。",
+    ]
+    assert command[command.index("--system-prompt") + 1] == llm.STRUCTURED_MEMORY_SYSTEM_PROMPT
+    # 通常回答と同じ原則: 非対話・ツール無効・セッション非永続・APIキーを渡さない
+    assert "-p" in command
+    assert command[command.index("--tools") + 1] == ""
+    assert "--no-session-persistence" in command
+    assert "ANTHROPIC_API_KEY" not in fake_run.kwargs["env"]
+
+
+def test_long_term_state_and_history_are_sent_before_retrieved_memories(fake_run):
+    memories = [{"text": "ユーザーの好きな果物は梨", "origin": "user", "evidence": "私の好きな果物は梨です。"}]
+    state = [
+        {
+            "subject": "user",
+            "key": "favorite_fruit",
+            "value": "りんご",
+            "evidence": "最近は好きな果物はりんごです。",
+            "updated_at": "2026-10-09T10:01:00+09:00",
+        }
+    ]
+    events = [
+        {
+            "timestamp": "2026-10-09T10:01:00+09:00",
+            "operation": "replace",
+            "subject": "user",
+            "key": "favorite_fruit",
+            "old_value": "梨",
+            "value": "りんご",
+            "evidence": "最近は好きな果物はりんごです。",
+        }
+    ]
+
+    ClaudeCLI().complete(
+        [{"role": "user", "content": "前に好きだった果物は？"}],
+        memories,
+        memory_state=state,
+        memory_history_events=events,
+    )
+
+    assert fake_run.kwargs["input"].split("\n") == [
+        "[long-term memory state]",
+        "- user.favorite_fruit: りんご (evidence: 最近は好きな果物はりんごです。, updated_at: 2026-10-09T10:01:00+09:00)",
+        "[/long-term memory state]",
+        "",
+        "[long-term memory history]",
+        "- 2026-10-09T10:01:00+09:00",
+        "  operation: replace",
+        "  subject: user",
+        "  key: favorite_fruit",
+        "  old_value: 梨",
+        "  value: りんご",
+        "  evidence: 最近は好きな果物はりんごです。",
+        "[/long-term memory history]",
+        "",
+        "[retrieved memories]",
+        "- ユーザーの好きな果物は梨 (origin: user, evidence: 私の好きな果物は梨です。)",
+        "[/retrieved memories]",
+        "",
+        "[user]",
+        "前に好きだった果物は？",
+    ]
