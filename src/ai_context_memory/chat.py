@@ -17,21 +17,29 @@ from .search import (
     SearchPlanError,
     normalize,
     parse_plan,
+    related_memory_pending,
     search_memories,
     search_memory_history,
+    search_memory_pending,
     search_memory_state,
     search_working_memory_history,
 )
 from .structured_memory import (
+    OP_ADD,
+    OP_PENDING,
+    OP_REPLACE,
     StructuredMemoryError,
+    add_pending,
     append_memory_history,
     load_memory_history,
+    load_memory_pending,
     load_memory_state,
+    parse_extraction,
+    save_memory_pending,
     save_memory_state,
     timestamp_now,
 )
 from .structured_memory import apply_candidates as apply_structured_candidates
-from .structured_memory import parse_candidates as parse_structured_candidates
 from .working_memory import (
     WorkingMemoryError,
     append_working_memory_history,
@@ -53,6 +61,8 @@ class Retrieval:
     search_log: list = field(default_factory=list)  # 長期記憶の検索ログ。件数は上の2つの合計
     memory_history_events: list = field(default_factory=list)  # ヒットした長期記憶の変更履歴（古い順）
     memory_history_log: list = field(default_factory=list)  # 検索しなかったターンは空
+    memory_pending: list = field(default_factory=list)  # 回答に渡す構造化した長期記憶の保留（保存順）
+    memory_pending_log: list = field(default_factory=list)  # 保留を検索しなかったターンは空
     history_events: list = field(default_factory=list)  # ヒットした作業記憶の変更履歴（古い順）
     history_log: list = field(default_factory=list)  # 検索しなかったターンは空
     warnings: list = field(default_factory=list)
@@ -68,6 +78,7 @@ class ChatSession:
         working_memory_history_path=None,
         memory_state_path=None,
         memory_history_path=None,
+        memory_pending_path=None,
     ):
         """history_path へは会話原文を追記するだけで、読み戻さない。
 
@@ -76,6 +87,7 @@ class ChatSession:
         working_memory_history_path へは作業記憶の変更履歴を追記し、検索が必要なターンで読み込む。
         memory_state_path を渡すと、構造化した長期記憶の現在値を検索対象として読み込む。
         memory_history_path へはその変更履歴を追記し、検索が必要なターンで読み込む。
+        memory_pending_path を渡すと、構造化した長期記憶の保留を読み込み、現在値と同じ検索で取得する。
         """
         self.llm = llm
         self.history_path = history_path
@@ -93,14 +105,17 @@ class ChatSession:
         self.memory_state_path = memory_state_path
         self.memory_history_path = memory_history_path
         self.memory_state = load_memory_state(memory_state_path) if memory_state_path else []
+        self.memory_pending_path = memory_pending_path
+        self.memory_pending = load_memory_pending(memory_pending_path) if memory_pending_path else []
 
     def retrieve(self, user_text):
         """ユーザー発話に答えるために必要な長期記憶と2つの変更履歴を検索し、Retrieval を返す。
 
         どれを検索するかと検索語はLLMに1回の検索プランで考えさせ、検索と回数の制御はここで行う。
         発話の意味はここでは解釈しない。
-        長期記憶は、従来の記憶と構造化した現在値を同じ検索語で検索し、
-        どちらも0件なら1回だけ検索語を変えて再検索する。変更履歴の検索はそれぞれ1回だけ。
+        長期記憶は、従来の記憶と構造化した現在値・保留を同じ検索語で検索し、
+        どれも0件なら1回だけ検索語を変えて再検索する。変更履歴の検索はそれぞれ1回だけ。
+        保留は、検索語でヒットしたものに加えて、ヒットした現在値の key につながるものも取得する。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
         """
         result = Retrieval()
@@ -116,7 +131,7 @@ class ChatSession:
                 memory_events = load_memory_history(self.memory_history_path)
             except StructuredMemoryError as e:
                 result.warnings.append(str(e))
-        has_long_term = bool(self.memories or self.memory_state)
+        has_long_term = bool(self.memories or self.memory_state or self.memory_pending)
         if not has_long_term and not events and not memory_events:
             # 検索できるものが無い
             return result
@@ -142,12 +157,20 @@ class ChatSession:
                 break
             found = search_memories(self.memories, queries)
             found_state = search_memory_state(self.memory_state, queries)
+            found_pending = search_memory_pending(self.memory_pending, queries)
             result.search_log.append((queries, len(found) + len(found_state)))
-            if found or found_state:
+            if found or found_state or found_pending:
                 result.memories.extend(found)
                 result.memory_state.extend(found_state)
                 break
             tried += queries
+        if result.search_log and self.memory_pending:
+            # 回答AIが古い現在値だけで断定しないよう、関係する保留を一緒に渡す
+            result.memory_pending = related_memory_pending(
+                self.memory_pending, result.memory_state, found_pending
+            )
+            keys = list(dict.fromkeys(item["key"] for item in result.memory_state))
+            result.memory_pending_log.append((keys + result.search_log[-1][0], len(result.memory_pending)))
         return result
 
     def recall(self, user_text):
@@ -156,12 +179,18 @@ class ChatSession:
         return result.memories, result.search_log, result.warnings
 
     def send(
-        self, user_text, memories=(), history_events=(), memory_state=(), memory_history_events=()
+        self,
+        user_text,
+        memories=(),
+        history_events=(),
+        memory_state=(),
+        memory_history_events=(),
+        memory_pending=(),
     ):
         """ユーザー発話を履歴に追加し、LLMへ渡して応答を返す。
 
         渡すのは作業記憶（常に全項目）、retrieve の結果（memories / history_events /
-        memory_state / memory_history_events）、現在の会話だけ。
+        memory_state / memory_history_events / memory_pending）、現在の会話だけ。
         """
         self.messages.append({"role": "user", "content": user_text})
         try:
@@ -172,6 +201,7 @@ class ChatSession:
                 history_events,
                 memory_state,
                 memory_history_events,
+                memory_pending,
             )
         except Exception:
             # 失敗した発話を残すとuserが連続するため、履歴を元に戻す
@@ -258,37 +288,57 @@ class ChatSession:
         return changes, warnings
 
     def update_memory_state(self, user_text):
-        """ユーザー発話から構造化した長期記憶の候補を提案させ、検証して反映し、(変更のリスト, 警告メッセージ) を返す。
+        """ユーザー発話と既存の値の関係をLLMに判断させ、検証して反映し、(変更のリスト, 警告メッセージ) を返す。
 
-        抽出の入力は現在値（subject / key / value）とユーザー発話だけで、assistantの発言は渡さない。
-        LLMは subject / key / value の候補を提案するだけで、
-        追加・置き換え・変更なしの判定と状態の書き換えはここで行う。
-        現在値を保存してから変更履歴を追記する。
+        判断の入力は現在値（subject / key / value）とユーザー発話だけで、assistantの発言は渡さない。
+        LLMは関係（replace / coexist / pending / no_change）を判断するだけで、
+        実行してよいかの確認と状態の書き換えはここで行う。確認できない置き換えは保留にする。
+        変更は、現在値の変更（operation が add / replace）と、新しく保存した保留（operation が pending）。
+        現在値を保存してから変更履歴を追記し、保留は別のファイルへ保存する。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
         """
         if not self.memory_state_path:
             return [], []
         try:
-            candidates = parse_structured_candidates(
+            candidates, recovered = parse_extraction(
                 self.llm.extract_structured_memory(user_text, self.memory_state)
             )
         except (LLMError, StructuredMemoryError) as e:
             return [], [f"長期状態を抽出できませんでした: {e}"]
 
+        warnings = []
+        if recovered:
+            warnings.append("長期状態の抽出結果にJSON以外の前置きがあったため、末尾のJSONだけを解析しました")
         timestamp = timestamp_now()
-        updated, changes, warnings = apply_structured_candidates(
+        updated, results, rejected = apply_structured_candidates(
             self.memory_state, candidates, user_text, timestamp
         )
+        warnings += rejected
+        changes = [c for c in results if c["operation"] in (OP_ADD, OP_REPLACE)]
+        held = [c for c in results if c["operation"] == OP_PENDING]
         if changes:
             try:
                 save_memory_state(self.memory_state_path, updated)
             except StructuredMemoryError as e:
-                return [], warnings + [str(e)]
-            self.memory_state = updated
-            if self.memory_history_path:
+                changes = []
+                warnings.append(str(e))
+            else:
+                self.memory_state = updated
+                if self.memory_history_path:
+                    try:
+                        append_memory_history(self.memory_history_path, changes, timestamp)
+                    except StructuredMemoryError as e:
+                        # 現在値は保存できているので、変更は有効なまま警告だけ返す
+                        warnings.append(str(e))
+        added = []
+        if held and self.memory_pending_path:
+            pending, added = add_pending(self.memory_pending, held, timestamp)
+            if added:
                 try:
-                    append_memory_history(self.memory_history_path, changes, timestamp)
+                    save_memory_pending(self.memory_pending_path, pending)
                 except StructuredMemoryError as e:
-                    # 現在値は保存できているので、変更は有効なまま警告だけ返す
+                    added = []
                     warnings.append(str(e))
-        return changes, warnings
+                else:
+                    self.memory_pending = pending
+        return changes + [{"operation": OP_PENDING, **item} for item in added], warnings

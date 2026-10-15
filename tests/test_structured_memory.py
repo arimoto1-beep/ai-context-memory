@@ -37,6 +37,7 @@ from ai_context_memory.structured_memory import (
     append_memory_history,
     apply_candidates,
     load_memory_history,
+    load_memory_pending,
     load_memory_state,
     parse_candidates,
     save_memory_state,
@@ -53,7 +54,40 @@ T3 = "2026-10-09T10:02:00+09:00"
 
 
 def candidate(key, value, evidence, subject="user"):
-    return {"subject": subject, "key": key, "value": value, "evidence": evidence}
+    """MVP8 の候補にあたる判断。MVP9 では、既存の key に関係しない新しい属性の coexist として出力される。"""
+    return {
+        "decision": "coexist",
+        "subject": subject,
+        "target_key": None,
+        "proposed_key": key,
+        "proposed_value": value,
+        "evidence": evidence,
+        "old_value_status": None,
+        "old_value_evidence": None,
+        "temporal_scope": "current",
+        "reason": "新しい属性です。",
+        "confirmation_question": None,
+    }
+
+
+def replacement(key, value, evidence, old_value_evidence, status="ended", scope="current"):
+    """MVP9 の replace の判断。"""
+    return {
+        "decision": "replace",
+        "subject": "user",
+        "target_key": key,
+        "proposed_key": None,
+        "proposed_value": value,
+        "evidence": evidence,
+        "old_value_status": status,
+        "old_value_evidence": old_value_evidence,
+        "temporal_scope": scope,
+        "reason": "既存の値が変わったと述べています。",
+        "confirmation_question": "以前の値は今も有効ですか？",
+    }
+
+
+CHANGED_TEXT = "好きな果物が梨からりんごに変わりました。"
 
 
 def extraction(*candidates):
@@ -218,6 +252,7 @@ def paths(tmp_path):
         data / "working_memory_history.jsonl",
         data / "long_term_memory_state.json",
         data / "long_term_memory_history.jsonl",
+        data / "long_term_memory_pending.json",
     )
 
 
@@ -465,16 +500,42 @@ def test_non_object_candidate_is_rejected_and_others_are_still_applied():
 # --- 現在値の状態遷移 ---
 
 
-def test_new_value_for_same_subject_and_key_replaces_current_value():
-    """9・10・11. 同じ subject + key に別の value が来たら replace。現在値には新しい value だけが残る。"""
+def test_explicit_change_for_same_subject_and_key_replaces_current_value():
+    """9・10・11. 既存の値の終了・変更が発言で確かめられる replace だけが置き換わる。現在値には新しい value だけが残る。"""
+    updated, changes, warnings = apply_candidates(
+        [PEAR],
+        [replacement("favorite_fruit", "りんご", CHANGED_TEXT, "梨からりんごに変わりました")],
+        CHANGED_TEXT,
+        T2,
+    )
+
+    assert updated == [item("favorite_fruit", "りんご", CHANGED_TEXT, T2)]
+    # 梨は根拠の発言の中に残るだけで、現在の値ではない
+    assert [i["value"] for i in updated] == ["りんご"]
+    # 古い値は変更（＝履歴のイベント）の old_value に残る
+    assert changes == [
+        {
+            "operation": "replace",
+            "subject": "user",
+            "key": "favorite_fruit",
+            "old_value": "梨",
+            "value": "りんご",
+            "evidence": CHANGED_TEXT,
+        }
+    ]
+    assert warnings == []
+
+
+def test_new_value_for_same_subject_and_key_is_held_without_explicit_change():
+    """MVP9: MVP8 では「同じ key・違う value」で replace していたが、置き換えずに保留にする。"""
     updated, changes, warnings = apply_candidates(
         [PEAR], [candidate("favorite_fruit", "りんご", APPLE_TEXT)], APPLE_TEXT, T2
     )
 
-    assert updated == [APPLE]
-    assert "梨" not in json.dumps(updated, ensure_ascii=False)
-    # 古い値は変更（＝履歴のイベント）の old_value に残る
-    assert changes == [{k: v for k, v in REPLACE_APPLE.items() if k != "timestamp"}]
+    assert updated == [PEAR]
+    assert [(c["operation"], c["target_value"], c["proposed_value"]) for c in changes] == [
+        ("pending", "梨", "りんご")
+    ]
     assert warnings == []
 
 
@@ -510,8 +571,8 @@ def test_same_value_ignores_case_and_character_width_only():
     )
 
     assert same[1] == []
-    # 表記が違うだけで同じ意味かどうかは、Pythonでは判断しない
-    assert [c["operation"] for c in different[1]] == ["replace"]
+    # 表記が違うだけで同じ意味かどうかは、Pythonでは判断しない（違う値なので、上書きせずに保留にする）
+    assert [c["operation"] for c in different[1]] == ["pending"]
 
 
 def test_different_key_is_added_independently():
@@ -535,8 +596,9 @@ def test_several_keys_in_one_utterance_are_all_applied():
         T3,
     )
 
-    assert [(i["key"], i["value"]) for i in updated] == [("favorite_fruit", "梨"), ("favorite_drink", "緑茶")]
-    assert [c["operation"] for c in changes] == ["replace", "add"]
+    # MVP9: 既存の key と衝突する値は上書きせず保留にし、新しい key は追加する
+    assert [(i["key"], i["value"]) for i in updated] == [("favorite_fruit", "りんご"), ("favorite_drink", "緑茶")]
+    assert [c["operation"] for c in changes] == ["pending", "add"]
 
 
 def test_same_key_twice_in_one_extraction_uses_only_the_first():
@@ -570,12 +632,23 @@ def test_python_has_no_keyword_table_and_uses_whatever_key_the_ai_chose():
 
 
 def test_pear_then_apple_then_coffee(paths, clock):
-    """成功条件1〜3: 梨で add、りんごで replace、コーヒーは別の key として add。"""
+    """MVP8 の成功条件1〜3 を MVP9 で: 梨で add、コーヒーは別の key として add。
+
+    「最近は好きな果物はりんごです。」は梨の終了を述べていないので、MVP9 では置き換えずに保留にする。
+    """
+    apple_pending = {
+        **candidate("favorite_fruit", "りんご", APPLE_TEXT),
+        "decision": "pending",
+        "target_key": "favorite_fruit",
+        "proposed_key": None,
+        "old_value_status": "not_stated",
+        "confirmation_question": "梨も今も好きですか？",
+    }
     llm = FakeLLM(
-        ["梨ですね。", "りんごに変わったんですね。", "コーヒーですね。"],
+        ["梨ですね。", "りんごがお好きなんですね。", "コーヒーですね。"],
         [
             extraction(candidate("favorite_fruit", "梨", PEAR_TEXT)),
-            extraction(candidate("favorite_fruit", "りんご", APPLE_TEXT)),
+            extraction(apple_pending),
             extraction(candidate("favorite_drink", "コーヒー", COFFEE_TEXT)),
         ],
     )
@@ -583,14 +656,17 @@ def test_pear_then_apple_then_coffee(paths, clock):
 
     outputs = run_cli(session, [PEAR_TEXT, APPLE_TEXT, COFFEE_TEXT, "exit"])
 
-    assert [o for o in outputs if o.startswith("[長期状態]")] == [
+    assert [o for o in outputs if o.startswith("[長期")] == [
         "[長期状態] user.favorite_fruit: 梨",
-        "[長期状態] user.favorite_fruit: 梨 → りんご",
+        "[長期保留] user.favorite_fruit: りんご（現在の値「梨」は変更していません）",
+        "[長期保留の確認事項] 梨も今も好きですか？（表示のみです。回答しても保留は自動では確定しません）",
         "[長期状態] user.favorite_drink: コーヒー",
     ]
-    assert load_memory_state(paths[4]) == STATE
-    assert "梨" not in paths[4].read_text(encoding="utf-8")
-    assert load_memory_history(paths[5]) == EVENTS
+    assert load_memory_state(paths[4]) == [PEAR, COFFEE]
+    assert load_memory_history(paths[5]) == [ADD_PEAR, ADD_COFFEE]
+    assert [(p["id"], p["proposed_value"], p["created_at"]) for p in load_memory_pending(paths[6])] == [
+        ("p001", "りんご", T2)
+    ]
     assert not any(o.startswith("[警告]") for o in outputs)
 
 
@@ -670,14 +746,14 @@ def test_current_state_is_read_after_restart(paths, clock):
         ["梨ですね。", "りんごに変わったんですね。"],
         [
             extraction(candidate("favorite_fruit", "梨", PEAR_TEXT)),
-            extraction(candidate("favorite_fruit", "りんご", APPLE_TEXT)),
+            extraction(replacement("favorite_fruit", "りんご", CHANGED_TEXT, "梨からりんごに変わりました")),
         ],
     )
-    run_cli(ChatSession(llm, *paths), [PEAR_TEXT, APPLE_TEXT, "exit"])
+    run_cli(ChatSession(llm, *paths), [PEAR_TEXT, CHANGED_TEXT, "exit"])
 
     restarted = ChatSession(FakeLLM([]), *paths)
 
-    assert restarted.memory_state == [APPLE]
+    assert restarted.memory_state == [item("favorite_fruit", "りんご", CHANGED_TEXT, T2)]
     assert restarted.messages == []
 
 
@@ -1242,15 +1318,17 @@ def test_system_prompt_says_history_values_are_not_current():
     assert "そこに無い変更を補って述べないでください。" in system
 
 
-def test_extraction_prompt_leaves_state_transition_to_python():
+def test_extraction_prompt_asks_for_the_relation_and_leaves_execution_to_python():
+    """MVP9: AIは既存の値との関係を判断するが、書き換えるかどうかはプログラムが確認して決める。"""
     prompt = llm_module.STRUCTURED_MEMORY_SYSTEM_PROMPT
 
     for word in ("subject", "key", "value", "evidence", "snake_case", "[long-term memory state]"):
         assert word in prompt
-    assert "新しい key を作らず、その key を一字一句そのまま使ってください。" in prompt
+    assert "新しい key を作らず、その key を一字一句そのまま target_key に使ってください。" in prompt
     assert "既存のどの key とも意味が違う属性なら、新しい key を作ってください。" in prompt
-    assert "値を追加するのか置き換えるのかを判断する必要はありません。" in prompt
-    assert "候補がなければ [] だけを返してください。" in prompt
+    assert "長期状態を実際に書き換えるかどうかは、別のプログラムが確認して決めます。" in prompt
+    assert "扱う属性がなければ [] だけを返してください。" in prompt
+    # 状態遷移の名前（operation）はAIに出させない
     assert "operation" not in prompt
 
 
@@ -1272,6 +1350,7 @@ def main_env(tmp_path, monkeypatch):
         "ACM_WORKING_MEMORY_HISTORY_FILE": "working_memory_history.jsonl",
         "ACM_LONG_TERM_MEMORY_STATE_FILE": "state.json",
         "ACM_LONG_TERM_MEMORY_HISTORY_FILE": "state_history.jsonl",
+        "ACM_LONG_TERM_MEMORY_PENDING_FILE": "pending.json",
     }
     for name, filename in names.items():
         monkeypatch.setenv(name, str(tmp_path / filename))

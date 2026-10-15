@@ -8,7 +8,7 @@ from .chat import ChatSession
 from .history import HistoryError
 from .llm import ClaudeCLI, LLMError
 from .memory import MemoryStoreError
-from .structured_memory import OP_REPLACE, StructuredMemoryError
+from .structured_memory import DECISION_PENDING, OP_PENDING, OP_REPLACE, StructuredMemoryError
 from .working_memory import OP_ADD, OP_REMOVE, WorkingMemoryError, count_items
 
 EXIT_COMMANDS = {"exit", "quit"}
@@ -20,6 +20,7 @@ DEFAULT_WORKING_MEMORY_FILE = Path("data") / "working_memory.json"
 DEFAULT_WORKING_MEMORY_HISTORY_FILE = Path("data") / "working_memory_history.jsonl"
 DEFAULT_MEMORY_STATE_FILE = Path("data") / "long_term_memory_state.json"
 DEFAULT_MEMORY_HISTORY_FILE = Path("data") / "long_term_memory_history.jsonl"
+DEFAULT_MEMORY_PENDING_FILE = Path("data") / "long_term_memory_pending.json"
 
 
 def run(session, input_fn=input, output_fn=print):
@@ -48,6 +49,9 @@ def run(session, input_fn=input, output_fn=print):
             for number, (queries, count) in enumerate(retrieval.search_log):
                 output_fn(f"[{'再検索' if number else '検索'}] {' / '.join(queries)}")
                 output_fn(f"[検索結果] {count}件")
+            for terms, count in retrieval.memory_pending_log:
+                output_fn(f"[長期保留検索] {' / '.join(terms)}")
+                output_fn(f"[長期保留検索結果] {count}件")
             for warning in retrieval.warnings:
                 output_fn(f"[警告] {warning}")
             reply = session.send(
@@ -56,6 +60,7 @@ def run(session, input_fn=input, output_fn=print):
                 retrieval.history_events,
                 retrieval.memory_state,
                 retrieval.memory_history_events,
+                retrieval.memory_pending,
             )
         except LLMError as e:
             output_fn(f"[エラー] {e}")
@@ -89,6 +94,8 @@ def run(session, input_fn=input, output_fn=print):
             continue
         for line in format_memory_state_changes(changes):
             output_fn(f"[長期状態] {line}")
+        for line in format_memory_pending_changes(changes):
+            output_fn(line)
         for warning in warnings:
             output_fn(f"[警告] {warning}")
 
@@ -121,13 +128,39 @@ def format_working_memory_changes(changes):
 
 
 def format_memory_state_changes(changes):
-    """構造化した長期記憶の変更を表示用の行にする。追加は新しい値、置き換えは「古い値 → 新しい値」。"""
+    """構造化した長期記憶の現在値の変更を表示用の行にする。追加は新しい値、置き換えは「古い値 → 新しい値」。"""
     lines = []
     for change in changes:
+        if change["operation"] == OP_PENDING:
+            continue
         value = change["value"]
         if change["operation"] == OP_REPLACE:
             value = f"{change['old_value']} → {value}"
         lines.append(f"{change['subject']}.{change['key']}: {value}")
+    return lines
+
+
+def format_memory_pending_changes(changes):
+    """新しく保存した保留を、見出し付きの表示用の行にする。現在値を変えていないこと、確定は自動では行わないことを示す。"""
+    lines = []
+    for change in changes:
+        if change["operation"] != OP_PENDING:
+            continue
+        key = change["target_key"] or change["proposed_key"]
+        line = f"[長期保留] {change['subject']}.{key}: {change['proposed_value'] or '値不明'}"
+        if change["target_value"] is not None:
+            line += f"（現在の値「{change['target_value']}」は変更していません）"
+        lines.append(line)
+        if change["decision"] != DECISION_PENDING:
+            lines.append(
+                f"[長期保留の理由] AIの判断は {change['decision']} でしたが、"
+                f"自動では反映しませんでした: {change['hold_reason']}"
+            )
+        if change["confirmation_question"]:
+            lines.append(
+                f"[長期保留の確認事項] {change['confirmation_question']}"
+                "（表示のみです。回答しても保留は自動では確定しません）"
+            )
     return lines
 
 
@@ -150,6 +183,9 @@ def main():
     memory_history_path = Path(
         os.environ.get("ACM_LONG_TERM_MEMORY_HISTORY_FILE") or DEFAULT_MEMORY_HISTORY_FILE
     )
+    memory_pending_path = Path(
+        os.environ.get("ACM_LONG_TERM_MEMORY_PENDING_FILE") or DEFAULT_MEMORY_PENDING_FILE
+    )
     try:
         session = ChatSession(
             ClaudeCLI(),
@@ -159,6 +195,7 @@ def main():
             working_memory_history_path,
             memory_state_path,
             memory_history_path,
+            memory_pending_path,
         )
     except (MemoryStoreError, WorkingMemoryError, StructuredMemoryError) as e:
         print(f"[エラー] {e}")
@@ -167,6 +204,8 @@ def main():
         print(f"長期記憶を読み込みました（{len(session.memories)} 件）。")
     if session.memory_state:
         print(f"長期状態を読み込みました（{len(session.memory_state)}項目）。")
+    if session.memory_pending:
+        print(f"長期保留を読み込みました（{len(session.memory_pending)}件）。")
     if count_items(session.working_memory):
         print(f"作業記憶を読み込みました（{count_items(session.working_memory)}項目）。")
     run(session)

@@ -1,6 +1,6 @@
 """記憶の検索。検索語を考えるのはAIで、ここでは検索プランの検証と単純な文字列検索だけを行う。
 
-検索対象は、長期記憶（従来の記憶と、構造化した現在値）、長期記憶の変更履歴、作業記憶の変更履歴。
+検索対象は、長期記憶（従来の記憶と、構造化した現在値・保留）、長期記憶の変更履歴、作業記憶の変更履歴。
 どれを検索するかもAIが検索プランで決める。
 """
 
@@ -20,6 +20,8 @@ HISTORY_SEARCH_KEYS = ("operation", "field", "text", "target", "evidence")
 # 構造化した長期記憶の現在値と、その変更履歴のイベントのうち、検索対象にする項目
 STATE_SEARCH_KEYS = ("subject", "key", "value", "evidence")
 MEMORY_HISTORY_SEARCH_KEYS = ("operation", "subject", "key", "value", "old_value", "evidence")
+# 構造化した長期記憶の保留のうち、検索対象にする項目
+PENDING_SEARCH_KEYS = ("subject", "target_key", "target_value", "proposed_key", "proposed_value", "evidence")
 
 
 class SearchPlanError(Exception):
@@ -153,3 +155,33 @@ def search_memory_history(events, queries, limit=MAX_HISTORY_RESULTS):
     検索対象は operation / subject / key / value / old_value / evidence。timestamp は検索しない。
     """
     return _search_events(events, queries, MEMORY_HISTORY_SEARCH_KEYS, limit)
+
+
+def search_memory_pending(items, queries, limit=MAX_RESULTS):
+    """検索語のどれかにヒットした保留を、スコアの高い順に limit 件まで返す。
+
+    ヒットの判定とスコアは search_memories と同じで、
+    検索対象は subject / target_key / target_value / proposed_key / proposed_value / evidence。
+    """
+    return _search_by_score(items, queries, PENDING_SEARCH_KEYS, limit)
+
+
+def related_memory_pending(items, state_items, found=(), limit=MAX_RESULTS):
+    """回答に渡す保留を、保存順で limit 件まで返す。
+
+    state_items は検索でヒットした現在値で、その subject + key に target_key か proposed_key で
+    つながる保留を優先して選び、残りを found（検索語でヒットした保留）から選ぶ。
+    つながる保留が limit を超える場合は、新しく保存されたものを残す。
+    """
+    addresses = {(i["subject"], i["key"]) for i in state_items}
+    linked = [
+        p
+        for p in reversed(items)
+        if (p["subject"], p.get("target_key")) in addresses
+        or (p["subject"], p.get("proposed_key")) in addresses
+    ]
+    chosen = []
+    for pending in linked + list(found):
+        if pending not in chosen and len(chosen) < limit:
+            chosen.append(pending)
+    return [p for p in items if p in chosen]
