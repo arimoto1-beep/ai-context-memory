@@ -2,11 +2,20 @@
 
 import json
 
+from .structured_memory import PartialWriteError, append_text
+
 ROLES = ("user", "assistant")
 
 
 class HistoryError(Exception):
-    """履歴ファイルの読み書きの失敗。メッセージはそのままユーザーに表示できる。"""
+    """履歴ファイルの読み書きの失敗。メッセージはそのままユーザーに表示できる。
+
+    partial が真なら、追記の途中で失敗し、途中まで書かれた行を取り除けなかった（ファイルの末尾が壊れている可能性がある）。
+    """
+
+    def __init__(self, message, partial=False):
+        super().__init__(message)
+        self.partial = partial
 
 
 def load_history(path):
@@ -44,11 +53,11 @@ def load_history(path):
 
 
 def append_history(path, messages):
-    """メッセージを履歴ファイルの末尾へ追記する。"""
+    """メッセージを履歴ファイルの末尾へ追記する。途中で失敗したら追記する前の長さに戻す。"""
     text = "".join(json.dumps(m, ensure_ascii=False) + "\n" for m in messages)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text)
+        append_text(path, text)
+    except PartialWriteError as e:
+        raise HistoryError(f"会話履歴を保存できませんでした: {e}", partial=True) from e
     except OSError as e:
         raise HistoryError(f"会話履歴を保存できませんでした: {path} ({e})") from e

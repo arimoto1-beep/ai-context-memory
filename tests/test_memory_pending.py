@@ -131,6 +131,8 @@ NAGOYA_PENDING = {
     "subject": "user",
     "target_key": "home_location",
     "target_value": "川崎",
+    # MVP10: 保留した時点の既存の値の updated_at と、確認で解決したときの記録
+    "target_updated_at": T0,
     "proposed_key": None,
     "proposed_value": "名古屋",
     "evidence": NOW_NAGOYA_TEXT,
@@ -140,6 +142,10 @@ NAGOYA_PENDING = {
     "confirmation_question": "川崎には今も住んでいますか？",
     "status": "unresolved",
     "created_at": T1,
+    "resolution": None,
+    "resolved_key": None,
+    "resolved_at": None,
+    "confirmation_id": None,
 }
 
 
@@ -282,6 +288,7 @@ def test_pending_keeps_the_current_value_and_holds_the_statement():
             "subject": "user",
             "target_key": "home_location",
             "target_value": "川崎",
+            "target_updated_at": T0,
             "proposed_key": None,
             "proposed_value": "名古屋",
             "evidence": NAGOYA_TEXT,
@@ -595,7 +602,7 @@ def test_downgraded_replace_keeps_the_new_statement(paths, clock):
         "[長期保留] user.home_location: 名古屋（現在の値「川崎」は変更していません）",
         "[長期保留の理由] AIの判断は replace でしたが、自動では反映しませんでした: "
         "old_value_evidence に既存の値「川崎」が含まれていません",
-        "[長期保留の確認事項] 川崎には今も住んでいますか？（表示のみです。回答しても保留は自動では確定しません）",
+        "[長期保留の確認事項] 川崎には今も住んでいますか？（/confirm p001 で確認できます）",
     ]
 
 
@@ -885,10 +892,15 @@ def test_system_prompt_forbids_inventing_circumstances_for_the_unknown_relation(
 
 
 def test_system_prompt_forbids_promising_to_resolve_pending():
-    """MVP9 仕上げ C. 保留を確定・更新する機能は無いので、それを約束しない。"""
+    """MVP9 仕上げ C. 回答AIの応答では保留を確定・更新できないので、それを約束しない。
+
+    MVP10 で、利用者がコマンドで始めたときだけ確認する機能が入ったため、「機能はまだありません」を差し替えた。
+    """
     system = llm_module.SYSTEM_PROMPT
 
-    assert "このシステムには、保留を確認して記録を確定・更新する機能はまだありません。" in system
+    assert "保留の確認は、利用者がコマンドで始めたときだけ、このシステムが質問を表示して行います。" in system
+    assert "あなたの応答の中で質問しても、記録は確定・更新されません。" in system
+    assert "機能はまだありません" not in system
     assert "ユーザーが答えれば記録が更新される、確定するといった約束をしないでください。" in system
     assert "未確定な関係を説明するところまでにしてください。" in system
 
@@ -1150,6 +1162,7 @@ def main_env(tmp_path, monkeypatch):
         "ACM_LONG_TERM_MEMORY_STATE_FILE": "state.json",
         "ACM_LONG_TERM_MEMORY_HISTORY_FILE": "state_history.jsonl",
         "ACM_LONG_TERM_MEMORY_PENDING_FILE": "pending.json",
+        "ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE": "confirmations.jsonl",
     }
     for name, filename in names.items():
         monkeypatch.setenv(name, str(tmp_path / filename))

@@ -659,7 +659,7 @@ def test_pear_then_apple_then_coffee(paths, clock):
     assert [o for o in outputs if o.startswith("[長期")] == [
         "[長期状態] user.favorite_fruit: 梨",
         "[長期保留] user.favorite_fruit: りんご（現在の値「梨」は変更していません）",
-        "[長期保留の確認事項] 梨も今も好きですか？（表示のみです。回答しても保留は自動では確定しません）",
+        "[長期保留の確認事項] 梨も今も好きですか？（/confirm p001 で確認できます）",
         "[長期状態] user.favorite_drink: コーヒー",
     ]
     assert load_memory_state(paths[4]) == [PEAR, COFFEE]
@@ -1351,6 +1351,7 @@ def main_env(tmp_path, monkeypatch):
         "ACM_LONG_TERM_MEMORY_STATE_FILE": "state.json",
         "ACM_LONG_TERM_MEMORY_HISTORY_FILE": "state_history.jsonl",
         "ACM_LONG_TERM_MEMORY_PENDING_FILE": "pending.json",
+        "ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE": "confirmations.jsonl",
     }
     for name, filename in names.items():
         monkeypatch.setenv(name, str(tmp_path / filename))

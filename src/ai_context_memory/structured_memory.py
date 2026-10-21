@@ -9,6 +9,7 @@ AIが replace と判断しても、既存の値の終了・訂正を発言の原
 """
 
 import json
+import os
 import re
 from datetime import datetime
 
@@ -60,12 +61,16 @@ ENDING_EXPRESSIONS = (
 )
 
 PENDING_STATUS_UNRESOLVED = "unresolved"
+# 確認によって解決した保留。解決の内容は resolution / resolved_key / resolved_at / confirmation_id に残す
+PENDING_STATUS_RESOLVED = "resolved"
+PENDING_STATUSES = (PENDING_STATUS_UNRESOLVED, PENDING_STATUS_RESOLVED)
 # 保留の1項目が持つキー（保存する順）。id / subject / evidence / created_at は必須、それ以外は文字列か null
 PENDING_KEYS = (
     "id",
     "subject",
     "target_key",
     "target_value",
+    "target_updated_at",
     "proposed_key",
     "proposed_value",
     "evidence",
@@ -75,8 +80,16 @@ PENDING_KEYS = (
     "confirmation_question",
     "status",
     "created_at",
+    "resolution",
+    "resolved_key",
+    "resolved_at",
+    "confirmation_id",
 )
 PENDING_REQUIRED_KEYS = ("id", "subject", "evidence", "created_at")
+
+# 同じ属性に同時に有効な値が複数あるとき、2つ目以降の値に付ける key の形（例: home_location_2）。
+# この形の key は、保留の確認で共存と判断したときにここで作るだけで、AIには作らせない。番号は優先順位を表さない
+NUMBERED_KEY_PATTERN = re.compile(r"(?P<base>[a-z][a-z0-9_]*?)_(?P<number>[0-9]+)")
 
 
 class StructuredMemoryError(Exception):
@@ -90,6 +103,108 @@ def timestamp_now(now=None):
 
 def _address(item):
     return item["subject"], item["key"]
+
+
+def attribute_base(key):
+    """番号付きの key（home_location_2）なら番号の無い key（home_location）を、それ以外はそのまま返す。"""
+    match = NUMBERED_KEY_PATTERN.fullmatch(key)
+    if match and int(match["number"]) >= 2:
+        return match["base"]
+    return key
+
+
+def find_item(items, subject, key):
+    """現在値から subject + key の項目を返す。無ければ None。"""
+    return next((item for item in items if _address(item) == (subject, key)), None)
+
+
+def same_attribute_items(items, subject, key):
+    """key と同じ属性の項目（番号の無い key と、その番号付きの key）を、保存順で返す。"""
+    base = attribute_base(key)
+    return [item for item in items if item["subject"] == subject and attribute_base(item["key"]) == base]
+
+
+def related_memory_state(items, found):
+    """検索でヒットした現在値に、同じ属性の項目（番号付きの key など）を足して返す。
+
+    同じ属性に値が複数あるとき、回答AIがどれか1つだけを見て断定しないようにするため。並びはヒットした順の後に保存順。
+    """
+    groups = {(item["subject"], attribute_base(item["key"])) for item in found}
+    extra = [
+        item
+        for item in items
+        if (item["subject"], attribute_base(item["key"])) in groups and item not in found
+    ]
+    return list(found) + extra
+
+
+def next_numbered_key(items, subject, key):
+    """key と同じ属性の値を新しく持たせるための、まだ使われていない番号付きの key を返す。"""
+    base = attribute_base(key)
+    used = {item["key"] for item in items if item["subject"] == subject}
+    number = 2
+    while f"{base}_{number}" in used:
+        number += 1
+    return f"{base}_{number}"
+
+
+def neutral_question(value):
+    """既存の値が今も有効かを、推測を含めずに確かめる質問。"""
+    return f"以前の「{value}」は今も有効ですか？"
+
+
+class PartialWriteError(StructuredMemoryError):
+    """追記の途中で失敗し、途中まで書かれた内容を取り除けなかった。ファイルの末尾が壊れている可能性がある。"""
+
+
+def write_text_atomic(path, text):
+    """一時ファイルへ書いてから置き換える。失敗しても元のファイルは書きかけにならない。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def append_text(path, text):
+    """ファイルの末尾へ追記する。途中で失敗したら、追記する前の長さに戻す。
+
+    戻せなかったときは PartialWriteError にする（末尾に途中までの行が残っている可能性があるため）。
+    前回の追記が改行の前で止まっていた場合に行がつながらないよう、末尾が改行でなければ改行を足してから書く。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        size = 0
+    try:
+        with open(path, "a+b") as f:
+            if size:
+                f.seek(size - 1)
+                if f.read(1) != b"\n":
+                    text = "\n" + text
+            f.seek(0, os.SEEK_END)
+            f.write(text.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        try:
+            if path.exists() and path.stat().st_size != size:
+                os.truncate(path, size)
+        except OSError as truncate_error:
+            raise PartialWriteError(
+                f"{path} への追記が途中で失敗し、途中まで書かれた内容を取り除けませんでした ({e}; {truncate_error})"
+            ) from e
+        raise
 
 
 def load_memory_state(path):
@@ -138,9 +253,7 @@ def save_memory_state(path, items):
     """現在値の全項目をファイルへ書き出す。"""
     text = json.dumps({"items": items}, ensure_ascii=False, indent=2) + "\n"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        write_text_atomic(path, text)
     except OSError as e:
         raise StructuredMemoryError(f"長期状態を保存できませんでした: {path} ({e})") from e
 
@@ -213,6 +326,9 @@ def _key_problem(candidate, name, required):
         return f"{name} がありません" if required else None
     if not isinstance(key, str) or len(key.strip()) > MAX_KEY_LENGTH or not KEY_PATTERN.fullmatch(key.strip()):
         return f"{name} の形式が不正です: {key}"
+    if name == "proposed_key" and attribute_base(key.strip()) != key.strip():
+        # 番号付きの key は、保留の確認で共存と判断したときにだけ作る（AIの命名と衝突させないため）
+        return f"proposed_key に番号付きの key は使えません: {key}"
     return None
 
 
@@ -297,12 +413,14 @@ def _held(candidate, target_key, target, hold_reason):
     question = _text(candidate, "confirmation_question")
     if question is None and target is not None:
         # 格下げした replace には質問が無いことがある。推測を含まない、既存の値を確かめる質問にする
-        question = f"以前の「{target['value']}」は今も有効ですか？"
+        question = neutral_question(target["value"])
     return {
         "operation": OP_PENDING,
         "subject": candidate["subject"],
         "target_key": target_key,
         "target_value": target["value"] if target else None,
+        # 確認するときに、保留した後で既存の値が変わっていないかを確かめるため
+        "target_updated_at": target.get("updated_at") if target else None,
         "proposed_key": _text(candidate, "proposed_key"),
         "proposed_value": _text(candidate, "proposed_value"),
         "evidence": candidate["evidence"],
@@ -422,9 +540,7 @@ def append_memory_history(path, changes, timestamp):
         for change in changes
     )
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(lines)
+        append_text(path, lines)
     except OSError as e:
         raise StructuredMemoryError(f"長期状態の変更履歴を保存できませんでした: {path} ({e})") from e
 
@@ -483,6 +599,7 @@ def load_memory_pending(path):
         isinstance(item, dict)
         and all(isinstance(item.get(k), str) for k in PENDING_REQUIRED_KEYS)
         and all(item.get(k) is None or isinstance(item.get(k), str) for k in PENDING_KEYS)
+        and (item.get("status") or PENDING_STATUS_UNRESOLVED) in PENDING_STATUSES
         for item in items
     ):
         raise StructuredMemoryError(
@@ -502,9 +619,7 @@ def save_memory_pending(path, items):
     """保留の全項目をファイルへ書き出す。"""
     text = json.dumps({"items": items}, ensure_ascii=False, indent=2) + "\n"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        write_text_atomic(path, text)
     except OSError as e:
         raise StructuredMemoryError(f"長期保留を保存できませんでした: {path} ({e})") from e
 
@@ -536,12 +651,13 @@ def add_pending(items, held, timestamp):
         if identity in seen:
             continue
         seen.add(identity)
-        item = {
+        fields = {
+            **proposal,
             "id": f"p{number:03d}",
-            **{k: v for k, v in proposal.items() if k != "operation"},
             "status": PENDING_STATUS_UNRESOLVED,
             "created_at": timestamp,
         }
+        item = {k: fields.get(k) for k in PENDING_KEYS}
         number += 1
         updated.append(item)
         added.append(item)

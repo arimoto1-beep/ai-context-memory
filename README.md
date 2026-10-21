@@ -2,7 +2,26 @@
 
 「忘れないAI」を段階的に作っていくPoCです。
 
-## 現在の状態: MVP9（記憶の誤上書きを防ぎ、Pending を導入する）
+## 現在の状態: MVP10（Pending を確認して解決する）※実装済み・未固定
+
+MVP9 で保存するようにした Pending（既存の値との関係が分からない発言）を、ユーザーに確認して解決できるようにする段階です。設計・保証範囲・スモークテストの結果は [docs/mvp-10.md](docs/mvp-10.md) にあります。
+
+- 利用者が `/confirm p001` で確認を始める。Python が Pending に保存済みの確認質問を表示し、**その直後の入力だけ**を回答として扱う。AI が自分から確認を始めることはしない
+- AI（Claude）が、回答が質問にどう答えているかを coexist（両方有効）/ replace（以前の値はもう無い）/ unresolved（判断できない）/ not_an_answer（質問への回答ではない）で判断する。Python が対象の Pending ID・現在値・形式を検証し、許された状態遷移だけを実行する
+- coexist は既存の値を残し、同じ属性の値を番号付きの key（`home_location_2`）で追加する。番号は優先順位を表さない。検索では同じ属性の key をまとめて回答 AI に渡す
+- **replace はすぐには実行しない。** Python が「「川崎」を user.home_location の現在の値から外し、「名古屋」を現在の値として登録します。実行しますか？（y/N）」と表示し、`y` のときだけ実行する。これは AI の解釈が正しいことを保証するものではなく、既存の値を消す更新をユーザーが確かめるための対策
+- unresolved と not_an_answer では何も変えない。not_an_answer の入力は通常の会話として処理する
+- 確認の根拠（表示した質問、生成された質問、回答、AI の判断と生の出力、Python の検証結果、変更計画、承認）は確認ログ `data/long_term_memory_confirmations.jsonl` に残す。これが正本で、変更履歴には `pending_id` / `confirmation_id` だけを持たせる
+- 質問は、表示する前に `prepared`（準備した）を記録し、出力処理が正常に終わった後にだけ `presented` を記録して、会話原文への保存と回答待ちを行う。出力に失敗した質問は表示済みにせず、回答も結び付けない。`presented` は出力処理が終わったことだけを表し、ユーザーが読んだことは保証しない
+- 状態を変える前に変更計画を確認ログへ書き、途中で失敗・中断したら、次の起動時（またはその場で1回）に計画と現在値を比べて完了させるか、実行しなかったことを記録する。自動で片付けられなければ起動を止める
+- 確認の回答のターンでは、通常の記憶抽出を行わない（同じ発言で二重に更新しないため）。回答に別の新しい情報が含まれていても、MVP10 では記憶に反映しない。会話原文には残す
+
+| 役割 | 担当 |
+|---|---|
+| 回答の意味の判断（共存・置換・不明・回答ではない） | AI |
+| 確認の開始、質問と回答の紐付け、検証、置換前の y/N、状態遷移、根拠の保存、復旧 | Python |
+
+## MVP9（記憶の誤上書きを防ぎ、Pending を導入する）
 
 AI が判断を間違えても、既存の記憶を不用意に壊さず、新しい発言も失わないようにする段階です。評価条件と、事前実験（実際の Claude で121回）の結果は [docs/mvp-09.md](docs/mvp-09.md) にあります。
 
@@ -14,7 +33,7 @@ MVP8 では、AI が同じ key だと判断すると、Python が機械的に現
 - 確かめられない置き換えや、既存の key との衝突は、捨てずに Pending（保留）へ格下げする。Pending は Current とは別のファイル（`data/long_term_memory_pending.json`）に保存され、再起動後も残る
 - **Pending は「新しい発言が疑わしい」という意味ではない。** 「名古屋に住んでいる」という発言は確実にあり、分からないのは川崎の住まいとの関係だけである。新しい情報を保存することと、既存の値を無効にすることを分けた
 - 回答時は、Current の検索でヒットした key に関係する Pending も一緒に渡す。回答用の Claude には、古い Current だけで断定しない・Pending を確定した値として扱わない・分からないことは分けて伝える、と指示している
-- Pending の確認質問は表示するだけで、ユーザーの回答から Pending を確定する処理はまだ無い（次の MVP 候補）
+- Pending の確認質問は表示するだけで、ユーザーの回答から Pending を確定する処理はまだ無い（MVP10 で `/confirm` を追加した）
 - 関係判断の出力の前に推論文が漏れて JSON の解析に失敗することがあったので、出力の末尾にある唯一の JSON だけを安全に取り出すようにした（取り出しても検証はすべて行う）
 - Current と History の保存形式は MVP8 と同じ。既存データの migration はしていない
 
@@ -117,6 +136,7 @@ MVP4 までの内容も変わっていません。
 | MVP7 | Working Memory の変更履歴を、AI が必要と判断したときだけ検索して渡す（[docs/mvp-07.md](docs/mvp-07.md)） |
 | MVP8 | Long-term Memory の一部を subject / key / value で持ち、現在値と変更履歴を分ける（[docs/mvp-08.md](docs/mvp-08.md)） |
 | MVP9 | AI が既存の値と新しい発言の関係を判断し、Python は確かめられる置き換えだけを実行する。残りは Pending として保存し、回答時に参照する（[docs/mvp-09.md](docs/mvp-09.md)） |
+| MVP10 | `/confirm` で Pending を確認し、AI が回答を判断し、Python が検証して共存・置換を実行する。置換は y/N で承認させ、根拠を確認ログに残す（[docs/mvp-10.md](docs/mvp-10.md)） |
 
 ## セットアップ
 
@@ -243,6 +263,24 @@ AI> 商用環境、開発環境、ステージング環境の3つです。
 AI> 商用環境と開発環境の2つでした。19:08:02 にステージング環境が対象外になり、19:08:24 に対象へ戻されています。
 ```
 
+Pending がある場合は、`/pending` で一覧を、`/pending p001` で1件の詳細と確認の記録を表示できます。`/confirm p001` で確認を始めると、保存済みの確認質問が表示され、次の入力が回答として扱われます（やめるには `/cancel`）。
+
+```text
+あなた> /confirm p001
+[確認] p001 user.home_location（確認 c001、1回目）
+[確認] 記録されている値: 川崎
+[確認] 新しい発言: 今は名古屋に住んでいます。（値: 名古屋）
+
+AI> 川崎の住まいも残っていますか？
+[確認] この質問への回答を入力してください（やめるには /cancel）
+
+あなた> いいえ、もうありません。
+[確認] 「川崎」を user.home_location の現在の値から外し、「名古屋」を現在の値として登録します（「川崎」は変更履歴に残ります）。実行しますか？（y/N）
+
+あなた> y
+[長期状態] user.home_location: 川崎 → 名古屋（確認 c001 で p001 を解決）
+```
+
 使用モデルは Claude Code 側の既定モデルです。環境変数 `ACM_MODEL` で変更できます（`claude --model` に渡せる値）。検索プラン作成・通常回答・長期記憶の抽出・長期状態の抽出・作業記憶の抽出のすべてに同じモデルを使います。
 
 ```powershell
@@ -256,6 +294,9 @@ $env:ACM_MODEL = "sonnet"
 | 検索できる記憶がまだ何も無い | 4回 | 通常回答・長期記憶の抽出・長期状態の抽出・作業記憶の抽出 |
 | 通常（検索は不要と判断されたターンも含む） | 5回 | 検索プラン作成 + 上の4回 |
 | 長期記憶の1回目の検索が0件 | 6回 | 上の5回 + 検索語の再生成 |
+| `/pending`・`/confirm`・`/cancel`、置換の y/N（MVP10） | 0回 | 質問は保存済みのものを使い、承認は Python が判定する |
+| 確認の回答（MVP10） | 1回 | 確認の判断だけ。通常回答・各抽出は行わない |
+| 確認の回答が not_an_answer（MVP10） | 1回 + 通常のターン | 確認の判断の後、その入力を通常のターンとして処理する |
 
 呼び出し回数は最適化していません。
 
@@ -269,12 +310,13 @@ $env:ACM_MODEL = "sonnet"
 | `data/working_memory_history.jsonl` | 作業記憶の変更履歴（add / replace / remove） | 毎回は渡さない。AI が必要と判断したターンにだけ読み込んで検索し、ヒットしたイベントだけを別枠で渡す |
 | `data/long_term_memory_state.json` | 長期状態。ユーザーについての属性の現在値（subject / key / value） | 起動時に読み込んで検索対象にし、検索でヒットした項目だけを別枠で渡す |
 | `data/long_term_memory_history.jsonl` | 長期状態の変更履歴（add / replace） | 毎回は渡さない。AI が必要と判断したターンにだけ読み込んで検索し、ヒットしたイベントだけを別枠で渡す |
-| `data/long_term_memory_pending.json` | 長期状態の保留（Pending）。既存の値との関係がまだ確認できていない発言（MVP9） | 起動時に読み込み、長期状態と同じ検索でヒットしたもの・関係するものだけを別枠で渡す |
+| `data/long_term_memory_pending.json` | 長期状態の保留（Pending）。既存の値との関係がまだ確認できていない発言（MVP9）。確認で解決したものも `status: resolved` として残す（MVP10） | 起動時に読み込み、未解決のもののうち、長期状態と同じ検索でヒットしたもの・関係するものだけを別枠で渡す |
+| `data/long_term_memory_confirmations.jsonl` | Pending の確認の記録（MVP10）。準備した質問（prepared）と出力処理が終わったこと（presented）・回答・AI の判断・検証結果・変更計画・承認。確認の根拠の正本 | 渡さない。長期状態の変更履歴を渡すときに、確認で行った変更の質問・回答・承認だけをここから引いて付ける |
 
 - 保存場所: 起動時のカレントディレクトリから見た `data/`（`chat.bat` から起動した場合はリポジトリ直下の `data/`）
 - `data/` は `.gitignore` の対象で、Git管理対象外です。会話内容も記憶もGitHubへ公開されることはありません
-- 会話もユーザーも作業も1つだけです。最初からやり直すには `data/` の7つのファイルを削除してください。作業を終えた・別の作業を始めるときは `data/working_memory.json` だけを削除してください（履歴は残ります）
-- 保存先は環境変数 `ACM_HISTORY_FILE` / `ACM_MEMORY_FILE` / `ACM_WORKING_MEMORY_FILE` / `ACM_WORKING_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_STATE_FILE` / `ACM_LONG_TERM_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_PENDING_FILE` で変更できます
+- 会話もユーザーも作業も1つだけです。最初からやり直すには `data/` の8つのファイルを削除してください。作業を終えた・別の作業を始めるときは `data/working_memory.json` だけを削除してください（履歴は残ります）
+- 保存先は環境変数 `ACM_HISTORY_FILE` / `ACM_MEMORY_FILE` / `ACM_WORKING_MEMORY_FILE` / `ACM_WORKING_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_STATE_FILE` / `ACM_LONG_TERM_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_PENDING_FILE` / `ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE` で変更できます
 
 ```powershell
 $env:ACM_HISTORY_FILE = "D:\work\trial\conversation.jsonl"
@@ -284,6 +326,7 @@ $env:ACM_WORKING_MEMORY_HISTORY_FILE = "D:\work\trial\working_memory_history.jso
 $env:ACM_LONG_TERM_MEMORY_STATE_FILE = "D:\work\trial\long_term_memory_state.json"
 $env:ACM_LONG_TERM_MEMORY_HISTORY_FILE = "D:\work\trial\long_term_memory_history.jsonl"
 $env:ACM_LONG_TERM_MEMORY_PENDING_FILE = "D:\work\trial\long_term_memory_pending.json"
+$env:ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE = "D:\work\trial\long_term_memory_confirmations.jsonl"
 ```
 
 ### 会話原文（conversation.jsonl）
