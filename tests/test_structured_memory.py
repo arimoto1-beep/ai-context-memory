@@ -1352,6 +1352,7 @@ def main_env(tmp_path, monkeypatch):
         "ACM_LONG_TERM_MEMORY_HISTORY_FILE": "state_history.jsonl",
         "ACM_LONG_TERM_MEMORY_PENDING_FILE": "pending.json",
         "ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE": "confirmations.jsonl",
+        "ACM_LONG_TERM_MEMORY_REVERTS_FILE": "reverts.jsonl",
     }
     for name, filename in names.items():
         monkeypatch.setenv(name, str(tmp_path / filename))

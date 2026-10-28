@@ -86,6 +86,8 @@ SYSTEM_PROMPT = (
     "target_key は関係する既存の属性、target_value は保留した時点のその属性の値、"
     "proposed_key と proposed_value はユーザーが述べた属性と値、evidence はその根拠となったユーザー発言です。"
     "proposed_value が無い項目は、発言から新しい値が分からなかったものです。"
+    "reopened_from がある項目は、一度確認して確定した変更を、ユーザーがコマンドで取り消したため、"
+    "確認の前と同じ未確認の保留に戻したものです（reopened_from は元の保留のID）。発言自体は撤回されていません。"
     "保留は、ユーザーがそう述べたという事実の記録です。発言の内容が疑わしいという意味ではありません。"
     "[long-term memory state] は以前の発言から記録された値で、その後に置き換わったことが確認されていないものです。"
     "保留は、その値との関係がまだ確認できていない、ユーザーの新しい発言です。"
@@ -111,12 +113,22 @@ SYSTEM_PROMPT = (
     "これは、ユーザーについての情報が過去にどう変わったかを、"
     "長期記憶の変更履歴から検索で取得したイベントで、古い順に並んでいます。"
     "各イベントの1行目は、その変更が行われた日時です。"
-    "operation は add（その属性の値が初めて記録された）か replace（値が別の値に置き換えられた）です。"
-    "value はそのとき新しく記録された値、old_value は replace のときだけあり、置き換えられる前の値です。"
+    "operation は add（その属性の値が初めて記録された）、replace（値が別の値に置き換えられた）、"
+    "revert（確認によって行った変更が取り消された）のいずれかです。"
+    "value はそのとき新しく記録された値、old_value は replace のときにあり、置き換えられる前の値です。"
     "pending_id と confirmation_id があるイベントは、保留をユーザーに確認して行った変更です。"
     "confirmation_question はこのシステムがユーザーに表示した確認の質問、"
     "confirmation_answer はそれに対するユーザーの回答で、その変更の根拠です。"
     "approval_input があるイベントは、変更の内容を表示してユーザーが実行を承認したものです。"
+    "revert のイベントは、reverted_confirmation_id の確認で行った変更（reverted_operation）を、"
+    "ユーザーがコマンドで取り消し、revert_approval_input の入力で実行を承認したものです。"
+    "revert の old_value は取り消しで外された値、value は取り消しで戻された値です"
+    "（value が無いのは、確認で追加された値を外しただけの取り消しです）。"
+    "取り消された確認の confirmation_question と confirmation_answer は、取り消された変更の根拠であって、"
+    "取り消しの根拠ではありません。それらを取り消しの理由として説明しないでください。"
+    "取り消しの理由は記録されていません。理由を推測して補わず、記録されていないと伝えてください。"
+    "取り消しは、ユーザーの発言を撤回したものでもありません。"
+    "取り消された確認の元になった発言は、reopened_pending_id の保留として、まだ確認されていない発言に戻っています。"
     "これらは過去の値の変更の記録であって、現在の値ではありません。"
     "old_value や、後のイベントで置き換えられた value を、現在の値として扱わないでください。"
     "現在の値については、[long-term memory state] を優先してください。"
@@ -154,9 +166,11 @@ SEARCH_PLAN_SYSTEM_PROMPT = (
     "[working memory] だけで答えられる発言では、needs_memory を false、queries を空配列にしてください。"
     "長期記憶の変更履歴には、ユーザー自身の属性の値が初めて記録されたとき・別の値に置き換えられたときの"
     "イベントが、日時つきで古い順に保存されています。"
-    "1つのイベントは、operation（add / replace のいずれか）、subject、key、"
+    "1つのイベントは、operation（add / replace / revert のいずれか）、subject、key、"
     "value（そのとき記録された値）、old_value（replace のときだけ。置き換えられる前の値）、"
     "evidence（その変更の根拠となったユーザー発言）を持ちます。"
+    "revert は、確認によって行った変更をユーザーが取り消したイベントで、"
+    "old_value に取り消しで外された値、value に取り消しで戻された値を持ち、evidence は持ちません。"
     "ユーザー自身のこと（好み、名前、住まいなど）が、以前はどうだったか、いつ・どのように変わったかのように、"
     "現在の値だけでは答えられず過去の値や変更の経緯が必要な場合は、"
     "needs_long_term_memory_history を true にし、memory_history_queries に検索語を最大3個入れてください。"
@@ -431,8 +445,8 @@ def format_memory_history(events):
     entries = []
     for event in events:
         lines = [f"- {event.get('timestamp', '')}"]
-        # old_value は replace のイベントにだけある。確認の項目は、保留を確認して行った変更にだけある
-        # （質問と回答の原文は、検索するときに確認ログから引いて付ける）
+        # old_value は replace と revert のイベントにだけある。確認の項目は、保留を確認して行った変更にだけある
+        # （質問と回答の原文は、検索するときに確認ログから引いて付ける）。取り消しの項目は revert のイベントにだけある
         lines += [
             f"  {key}: {event[key]}"
             for key in (
@@ -447,6 +461,11 @@ def format_memory_history(events):
                 "confirmation_question",
                 "confirmation_answer",
                 "approval_input",
+                "revert_id",
+                "reverted_confirmation_id",
+                "reverted_operation",
+                "reopened_pending_id",
+                "revert_approval_input",
             )
             if event.get(key)
         ]
@@ -464,7 +483,9 @@ def format_memory_pending(items):
         # 値が無い項目（新しい値が分からなかった保留など）は行ごと省く
         lines += [
             f"  {key}: {item[key]}"
-            for key in ("subject", "target_key", "target_value", "proposed_key", "proposed_value", "evidence")
+            for key in (
+                "subject", "target_key", "target_value", "proposed_key", "proposed_value", "evidence", "reopened_from"
+            )
             if item.get(key)
         ]
         entries.append("\n".join(lines))

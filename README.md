@@ -2,7 +2,26 @@
 
 「忘れないAI」を段階的に作っていくPoCです。
 
-## 現在の状態: MVP10（Pending を確認して解決する）※実装済み・未固定
+## 現在の状態: MVP11（確定した記憶変更を取り消す）※実装済み・未固定
+
+MVP10 の確認で確定した記憶の変更1件を、利用者のコマンドと y/N の承認で取り消せるようにする段階です。設計・保証範囲・スモークテストの結果は [docs/mvp-11.md](docs/mvp-11.md) にあります。
+
+- `/revert` で取り消せる確認の一覧（取り消せないものは理由）を、`/revert c001` で取り消しの内容を表示し、`y` のときだけ実行する。Claude は呼ばない
+- 置換（`川崎 → 名古屋`）の取り消しは、確認の前の値と根拠の発言（`川崎` / 「今は川崎に住んでいます。」）に戻す。`updated_at` は取り消した時刻にする（元の時刻に戻すと、確定の前に作られた古い保留が誤って確認できるようになるため）
+- 共存（`home_location_2 = 名古屋` の追加）の取り消しは、追加した key を現在値から外す。ほかの値は変えない
+- **取り消しは発言の撤回ではない。** 確認で解決した保留は `reverted` になり、同じ発言の新しい保留（`reopened_from: p001`）を作る。`/confirm` でもう一度確認できる
+- 会話原文・変更履歴・確認ログは消さない。変更履歴には `operation: revert` のイベントを追記し、取り消した確認を `reverted_confirmation_id` で指す（元の `confirmation_id` のキーは使わない）
+- 確定の後に同じ key が変わっている（変わって戻った場合を含む）、既に取り消した、確認ログと変更履歴が食い違う、戻すと同じ属性に同じ値が重なる、などの場合は取り消さない。取り消すと確認できなくなる保留があれば、承認の前にその ID と理由を表示する
+- 取り消しの記録は取り消しログ `data/long_term_memory_reverts.jsonl` に、確認と同じ手順（prepared → 出力 → presented → y/N → commit → applied）で残す。途中で止まったら、次の起動時に現在値の全体を計画と比べて完了させるか、実行しなかったことを記録する。どちらとも一致しなければ起動を止める
+- 現在値を変えなかった確認（同じ値が既にあった共存）の取り消しは、MVP11 では扱わない（一覧に理由を表示する）
+- 共存で使った番号付きの key は、取り消した後も再利用しない（変更履歴に現れる key も使用済みとする）
+
+| 役割 | 担当 |
+|---|---|
+| 取り消せるかの検証、変更内容の表示、y/N、状態遷移、記録、復旧 | Python（AI は関わらない） |
+| 取り消しの記録を読んで経緯を説明する | AI（取り消しの理由は記録されていないので推測しないよう指示） |
+
+## MVP10（Pending を確認して解決する）
 
 MVP9 で保存するようにした Pending（既存の値との関係が分からない発言）を、ユーザーに確認して解決できるようにする段階です。設計・保証範囲・スモークテストの結果は [docs/mvp-10.md](docs/mvp-10.md) にあります。
 
@@ -137,6 +156,7 @@ MVP4 までの内容も変わっていません。
 | MVP8 | Long-term Memory の一部を subject / key / value で持ち、現在値と変更履歴を分ける（[docs/mvp-08.md](docs/mvp-08.md)） |
 | MVP9 | AI が既存の値と新しい発言の関係を判断し、Python は確かめられる置き換えだけを実行する。残りは Pending として保存し、回答時に参照する（[docs/mvp-09.md](docs/mvp-09.md)） |
 | MVP10 | `/confirm` で Pending を確認し、AI が回答を判断し、Python が検証して共存・置換を実行する。置換は y/N で承認させ、根拠を確認ログに残す（[docs/mvp-10.md](docs/mvp-10.md)） |
+| MVP11 | `/revert` で、確認による確定1件を、記録を消さずに取り消す。元の発言は新しい Pending に戻す（[docs/mvp-11.md](docs/mvp-11.md)） |
 
 ## セットアップ
 
@@ -281,6 +301,18 @@ AI> 川崎の住まいも残っていますか？
 [長期状態] user.home_location: 川崎 → 名古屋（確認 c001 で p001 を解決）
 ```
 
+確認で確定した変更は、`/revert` で一覧を表示し、`/revert c001` で取り消せます（`y` のときだけ実行）。
+
+```text
+あなた> /revert c001
+[取り消し] r001: 確認 c001 の取り消し
+[取り消し] 確認 c001（p001）による変更を取り消します。user.home_location を「名古屋」から、確認の前の値「川崎」（根拠の発言: 今は川崎に住んでいます。）に戻します。「名古屋」についての発言（今は名古屋に住んでいます。）は撤回されず、新しい保留 p002 として残ります。/confirm p002 で確認し直せます。元の確認の記録・会話原文・変更履歴は削除せず、取り消したことを変更履歴に追加します。実行しますか？（y/N）
+
+あなた> y
+[長期状態] user.home_location: 名古屋 → 川崎（r001 で確認 c001 を取り消し。p001 は reverted、発言は保留 p002 に戻しました）
+[取り消し] もう一度確認するには /confirm p002
+```
+
 使用モデルは Claude Code 側の既定モデルです。環境変数 `ACM_MODEL` で変更できます（`claude --model` に渡せる値）。検索プラン作成・通常回答・長期記憶の抽出・長期状態の抽出・作業記憶の抽出のすべてに同じモデルを使います。
 
 ```powershell
@@ -297,6 +329,7 @@ $env:ACM_MODEL = "sonnet"
 | `/pending`・`/confirm`・`/cancel`、置換の y/N（MVP10） | 0回 | 質問は保存済みのものを使い、承認は Python が判定する |
 | 確認の回答（MVP10） | 1回 | 確認の判断だけ。通常回答・各抽出は行わない |
 | 確認の回答が not_an_answer（MVP10） | 1回 + 通常のターン | 確認の判断の後、その入力を通常のターンとして処理する |
+| `/revert`・`/revert c001`・取り消しの y/N（MVP11） | 0回 | 検証・表示・承認・実行はすべて Python が行う |
 
 呼び出し回数は最適化していません。
 
@@ -309,14 +342,15 @@ $env:ACM_MODEL = "sonnet"
 | `data/working_memory.json` | 作業記憶の現在状態。現在の作業の Mission / Scope / Acceptance Criteria | 起動時に読み込み、存在する限り毎回すべて渡す |
 | `data/working_memory_history.jsonl` | 作業記憶の変更履歴（add / replace / remove） | 毎回は渡さない。AI が必要と判断したターンにだけ読み込んで検索し、ヒットしたイベントだけを別枠で渡す |
 | `data/long_term_memory_state.json` | 長期状態。ユーザーについての属性の現在値（subject / key / value） | 起動時に読み込んで検索対象にし、検索でヒットした項目だけを別枠で渡す |
-| `data/long_term_memory_history.jsonl` | 長期状態の変更履歴（add / replace） | 毎回は渡さない。AI が必要と判断したターンにだけ読み込んで検索し、ヒットしたイベントだけを別枠で渡す |
-| `data/long_term_memory_pending.json` | 長期状態の保留（Pending）。既存の値との関係がまだ確認できていない発言（MVP9）。確認で解決したものも `status: resolved` として残す（MVP10） | 起動時に読み込み、未解決のもののうち、長期状態と同じ検索でヒットしたもの・関係するものだけを別枠で渡す |
+| `data/long_term_memory_history.jsonl` | 長期状態の変更履歴（add / replace、MVP11 から revert） | 毎回は渡さない。AI が必要と判断したターンにだけ読み込んで検索し、ヒットしたイベントだけを別枠で渡す |
+| `data/long_term_memory_pending.json` | 長期状態の保留（Pending）。既存の値との関係がまだ確認できていない発言（MVP9）。確認で解決したものも `status: resolved` として残す（MVP10）。取り消したものは `status: reverted` として残し、同じ発言の新しい保留を作る（MVP11） | 起動時に読み込み、未解決のもののうち、長期状態と同じ検索でヒットしたもの・関係するものだけを別枠で渡す |
 | `data/long_term_memory_confirmations.jsonl` | Pending の確認の記録（MVP10）。準備した質問（prepared）と出力処理が終わったこと（presented）・回答・AI の判断・検証結果・変更計画・承認。確認の根拠の正本 | 渡さない。長期状態の変更履歴を渡すときに、確認で行った変更の質問・回答・承認だけをここから引いて付ける |
+| `data/long_term_memory_reverts.jsonl` | 確定の取り消しの記録（MVP11）。準備した変更内容（prepared）と出力処理が終わったこと（presented）・y/N の入力・変更計画・結果 | 渡さない。変更履歴の revert のイベントを渡すときに、取り消しの承認の入力だけをここから引いて付ける |
 
 - 保存場所: 起動時のカレントディレクトリから見た `data/`（`chat.bat` から起動した場合はリポジトリ直下の `data/`）
 - `data/` は `.gitignore` の対象で、Git管理対象外です。会話内容も記憶もGitHubへ公開されることはありません
-- 会話もユーザーも作業も1つだけです。最初からやり直すには `data/` の8つのファイルを削除してください。作業を終えた・別の作業を始めるときは `data/working_memory.json` だけを削除してください（履歴は残ります）
-- 保存先は環境変数 `ACM_HISTORY_FILE` / `ACM_MEMORY_FILE` / `ACM_WORKING_MEMORY_FILE` / `ACM_WORKING_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_STATE_FILE` / `ACM_LONG_TERM_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_PENDING_FILE` / `ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE` で変更できます
+- 会話もユーザーも作業も1つだけです。最初からやり直すには `data/` の9つのファイルを削除してください。作業を終えた・別の作業を始めるときは `data/working_memory.json` だけを削除してください（履歴は残ります）
+- 保存先は環境変数 `ACM_HISTORY_FILE` / `ACM_MEMORY_FILE` / `ACM_WORKING_MEMORY_FILE` / `ACM_WORKING_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_STATE_FILE` / `ACM_LONG_TERM_MEMORY_HISTORY_FILE` / `ACM_LONG_TERM_MEMORY_PENDING_FILE` / `ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE` / `ACM_LONG_TERM_MEMORY_REVERTS_FILE` で変更できます
 
 ```powershell
 $env:ACM_HISTORY_FILE = "D:\work\trial\conversation.jsonl"
@@ -327,6 +361,7 @@ $env:ACM_LONG_TERM_MEMORY_STATE_FILE = "D:\work\trial\long_term_memory_state.jso
 $env:ACM_LONG_TERM_MEMORY_HISTORY_FILE = "D:\work\trial\long_term_memory_history.jsonl"
 $env:ACM_LONG_TERM_MEMORY_PENDING_FILE = "D:\work\trial\long_term_memory_pending.json"
 $env:ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE = "D:\work\trial\long_term_memory_confirmations.jsonl"
+$env:ACM_LONG_TERM_MEMORY_REVERTS_FILE = "D:\work\trial\long_term_memory_reverts.jsonl"
 ```
 
 ### 会話原文（conversation.jsonl）
@@ -951,9 +986,11 @@ src/ai_context_memory/
   memory.py    長期記憶ファイル（JSONL）の読み込みと追記、記憶候補の解析と検証
   search.py    検索プランの解析と検証、長期記憶・長期状態（現在値・保留・変更履歴）・作業記憶の変更履歴の文字列検索、回答に渡す保留の選択
   structured_memory.py  長期状態（subject / key / value）の現在値ファイル（JSON）の読み込みと保存、関係判断の解析（JSON の取り出しを含む）・検証、replace の条件の確認と保留への格下げ、変更履歴（JSONL）の追記と読み込み、保留ファイル（JSON）の読み込みと保存・重複の抑制
+  confirmation.py  保留の確認（MVP10）: 確認ログ、解決できるかの判定、AI の判断の検証、変更計画、冪等な実行と復旧
+  revert.py    確定の取り消し（MVP11）: 取り消しログ、取り消せるかの判定、変更計画、冪等な実行と復旧
   working_memory.py  作業記憶ファイル（JSON）の読み込みと保存、候補（add / replace / remove）の解析・検証・反映、変更履歴（JSONL）の追記と読み込み
   cli.py       対話ループ（入力・表示・終了・エラー表示）
   __main__.py  python -m ai_context_memory の入口
 tests/
-  test_chat.py / test_cli.py / test_history.py / test_llm.py / test_memory.py / test_search.py / test_working_memory.py / test_working_memory_history.py / test_structured_memory.py / test_memory_pending.py
+  test_chat.py / test_cli.py / test_history.py / test_llm.py / test_memory.py / test_search.py / test_working_memory.py / test_working_memory_history.py / test_structured_memory.py / test_memory_pending.py / test_memory_confirmation.py / test_memory_revert.py
 ```

@@ -1512,6 +1512,7 @@ def test_main_reports_resolved_pending_and_recovery(tmp_path, monkeypatch, capsy
     )
     for name, path in zip(names, paths):
         monkeypatch.setenv(name, str(path))
+    monkeypatch.setenv("ACM_LONG_TERM_MEMORY_REVERTS_FILE", str(tmp_path / "data" / "long_term_memory_reverts.jsonl"))
     monkeypatch.setattr(cli_module, "ClaudeCLI", lambda: FakeLLM())
     monkeypatch.setattr(cli_module.sys, "stdin", FakeStdin("exit\n"))
     monkeypatch.setattr(cli_module.sys.stdout, "reconfigure", lambda **kwargs: None, raising=False)

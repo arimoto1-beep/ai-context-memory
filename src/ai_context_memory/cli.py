@@ -16,11 +16,13 @@ from .confirmation import QUESTION_SOURCE_PENDING, ConfirmationError
 from .history import HistoryError
 from .llm import ClaudeCLI, LLMError
 from .memory import MemoryStoreError
+from .revert import RevertError
 from .structured_memory import (
     DECISION_PENDING,
     OP_ADD,
     OP_PENDING,
     OP_REPLACE,
+    PENDING_STATUS_REVERTED,
     StructuredMemoryError,
 )
 from .working_memory import OP_ADD as WORKING_OP_ADD
@@ -37,17 +39,19 @@ DEFAULT_MEMORY_STATE_FILE = Path("data") / "long_term_memory_state.json"
 DEFAULT_MEMORY_HISTORY_FILE = Path("data") / "long_term_memory_history.jsonl"
 DEFAULT_MEMORY_PENDING_FILE = Path("data") / "long_term_memory_pending.json"
 DEFAULT_MEMORY_CONFIRMATIONS_FILE = Path("data") / "long_term_memory_confirmations.jsonl"
+DEFAULT_MEMORY_REVERTS_FILE = Path("data") / "long_term_memory_reverts.jsonl"
 
-# 保留の確認のコマンド。これ以外の「/」で始まる入力は、これまでどおり通常の発言として扱う
+# 保留の確認と、確定の取り消しのコマンド。これ以外の「/」で始まる入力は、これまでどおり通常の発言として扱う
 COMMAND_PENDING = "/pending"
 COMMAND_CONFIRM = "/confirm"
 COMMAND_CANCEL = "/cancel"
+COMMAND_REVERT = "/revert"
 
 
 def parse_command(user_text):
-    """確認のコマンドなら (コマンド, 引数か None) を、そうでなければ None を返す。"""
+    """確認・取り消しのコマンドなら (コマンド, 引数か None) を、そうでなければ None を返す。"""
     parts = user_text.split()
-    if parts[0] in (COMMAND_PENDING, COMMAND_CONFIRM) and len(parts) <= 2:
+    if parts[0] in (COMMAND_PENDING, COMMAND_CONFIRM, COMMAND_REVERT) and len(parts) <= 2:
         return parts[0], parts[1] if len(parts) == 2 else None
     if parts[0] == COMMAND_CANCEL and len(parts) == 1:
         return parts[0], None
@@ -61,16 +65,21 @@ def run(session, input_fn=input, output_fn=print):
             user_text = input_fn("\nあなた> ").strip()
         except (EOFError, KeyboardInterrupt):
             output_fn("")
-            for warning in session.cancel_confirmation("入力が終了しました"):
+            for warning in session.cancel_confirmation("入力が終了しました") + session.cancel_revert("入力が終了しました"):
                 output_fn(f"[警告] {warning}")
             break
 
         if not user_text:
             continue
         if user_text.lower() in EXIT_COMMANDS:
-            for warning in session.cancel_confirmation("終了しました"):
+            for warning in session.cancel_confirmation("終了しました") + session.cancel_revert("終了しました"):
                 output_fn(f"[警告] {warning}")
             break
+
+        if session.awaiting_revert:
+            # 取り消しの実行前の確認。y 以外の入力（コマンドを含む）は、すべて「実行しない」
+            report_revert(session.approve_revert(user_text), output_fn)
+            continue
 
         if session.awaiting_approval:
             # 置換の実行前の確認。y 以外の入力（コマンドを含む）は、すべて「実行しない」
@@ -115,6 +124,9 @@ def run_command(session, command, output_fn):
         for line in lines:
             output_fn(line)
         return
+    if name == COMMAND_REVERT:
+        run_revert(session, argument, output_fn)
+        return
     if argument is None:
         output_fn("[確認] 確認する保留の ID を指定してください（例: /confirm p001）。一覧は /pending")
         return
@@ -143,6 +155,78 @@ def run_command(session, command, output_fn):
         return
     for warning in warnings:
         output_fn(f"[警告] {warning}")
+
+
+def run_revert(session, argument, output_fn):
+    """/revert（一覧）と /revert <確認 ID>（変更内容を表示して y/N を待つ）。"""
+    if argument is None:
+        for line in format_revert_overview(session):
+            output_fn(line)
+        return
+    try:
+        started = session.start_revert(argument)
+    except RevertError as e:
+        output_fn(f"[取り消し] {e}")
+        return
+    try:
+        output_fn(f"[取り消し] {started['revert_id']}: 確認 {started['confirmation_id']} の取り消し")
+        output_fn(f"[取り消し] {started['prompt']}")
+    except BaseException:
+        # 出力できなかった文面は表示済みにせず、y/N も待たない
+        session.abandon_prepared_revert("変更内容を出力できませんでした")
+        raise
+    try:
+        session.mark_revert_presented(started["revert_id"])
+    except RevertError as e:
+        output_fn(f"[取り消し] {e}。次の入力は承認として扱いません")
+
+
+def report_revert(result, output_fn):
+    """取り消しの y/N の結果を表示する。"""
+    for warning in result.warnings:
+        output_fn(f"[警告] {warning}")
+    plan = result.plan
+    if result.status == CONFIRMATION_APPLIED:
+        reopened = plan["reopened_pending"]["id"]
+        done = (
+            f"{result.revert_id} で確認 {result.confirmation_id} を取り消し。"
+            f"{plan['target_pending_id']} は reverted、発言は保留 {reopened} に戻しました"
+        )
+        if plan["restored"] is not None:
+            output_fn(f"[長期状態] {plan['subject']}.{plan['key']}: {plan['removed_value']} → {plan['restored']['value']}（{done}）")
+        else:
+            output_fn(f"[長期状態] {plan['subject']}.{plan['key']}: {plan['removed_value']} → 現在の値から外しました（{done}）")
+        output_fn(f"[取り消し] もう一度確認するには /confirm {reopened}")
+    elif result.status == CONFIRMATION_DECLINED:
+        output_fn(f"[取り消し] 取り消しませんでした。確認 {result.confirmation_id} の変更はそのままです")
+    else:
+        output_fn(f"[取り消し] 取り消しませんでした: {result.reason}")
+
+
+def format_revert_overview(session):
+    try:
+        candidates = session.revert_overview()
+    except StructuredMemoryError as e:
+        return [f"[取り消し] {e}"]
+    if not candidates:
+        return ["[取り消し] 記憶を変更した確認はありません"]
+    lines = []
+    for confirmation_id, plan, problem in candidates:
+        if plan and plan.get("operation") == OP_REPLACE:
+            change = f"{plan['subject']}.{plan['key']}: {plan['old_value']} → {plan['value']}"
+        elif plan and plan.get("operation") == OP_ADD:
+            change = f"{plan['subject']}.{plan['key']}: {plan['value']} を追加"
+        elif plan:
+            change = f"{plan['subject']}.{plan['key']}: 現在値の変更なし"
+        else:
+            change = "変更内容不明"
+        pending_id = plan["pending_id"] if plan else "?"
+        lines.append(f"[取り消し] {confirmation_id}（{pending_id}）{change}")
+        if problem:
+            lines.append(f"[取り消し]   取り消せません: {problem}")
+        else:
+            lines.append(f"[取り消し]   /revert {confirmation_id} で取り消せます")
+    return lines
 
 
 def report_confirmation(result, output_fn):
@@ -184,7 +268,10 @@ def format_pending_overview(session):
         line = f"[長期保留] {pending['id']} {pending['subject']}.{key}: {pending['proposed_value'] or '値不明'}"
         if pending["target_value"] is not None:
             line += f"（現在の値「{pending['target_value']}」）"
-        lines.append(line + f" 発言: {pending['evidence']}")
+        line += f" 発言: {pending['evidence']}"
+        if pending.get("reopened_from"):
+            line += f"（{pending['reopened_by']} で {pending['reopened_from']} の確定を取り消して保留に戻したもの）"
+        lines.append(line)
         history = f"これまでの確認 {attempts}回" + (f"、前回の判断: {last}" if last else "")
         if problem:
             lines.append(f"[長期保留]   確認できません: {problem}（{history}）")
@@ -214,6 +301,10 @@ def format_pending_details(session, pending_id):
             "resolved_key",
             "resolved_at",
             "confirmation_id",
+            "reverted_by",
+            "reverted_at",
+            "reopened_from",
+            "reopened_by",
         )
         if pending.get(key)
     ]
@@ -223,7 +314,27 @@ def format_pending_details(session, pending_id):
         lines.append(
             f"[確認記録] {event['confirmation_id']} {event['event']} {event['timestamp']}{describe_event(event, legacy)}"
         )
+    for event in session.pending_reverts(pending_id):
+        lines.append(
+            f"[取り消し記録] {event['revert_id']} {event['event']} {event['timestamp']}"
+            f"（確認 {event['target_confirmation_id']} の取り消し）{describe_revert_event(event)}"
+        )
     return lines
+
+
+def describe_revert_event(event):
+    name = event["event"]
+    if name == "prepared":
+        return " 変更内容を準備（表示したことは意味しない）"
+    if name == "presented":
+        return " 変更内容の出力処理が正常に終了"
+    if name == "approval":
+        return f" 入力「{event['input']}」 {'承認' if event['approved'] else '承認されず'}"
+    if name == "commit":
+        return f" 変更計画: {event['plan']['subject']}.{event['plan']['key']} の {event['plan']['reverted_operation']} を取り消し"
+    if event.get("reason") or event.get("error"):
+        return f" {event.get('reason') or event.get('error')}"
+    return ""
 
 
 def describe_event(event, legacy=False):
@@ -404,6 +515,7 @@ def main():
     memory_confirmations_path = Path(
         os.environ.get("ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE") or DEFAULT_MEMORY_CONFIRMATIONS_FILE
     )
+    memory_reverts_path = Path(os.environ.get("ACM_LONG_TERM_MEMORY_REVERTS_FILE") or DEFAULT_MEMORY_REVERTS_FILE)
     try:
         session = ChatSession(
             ClaudeCLI(),
@@ -415,6 +527,7 @@ def main():
             memory_history_path,
             memory_pending_path,
             memory_confirmations_path,
+            memory_reverts_path,
         )
     except (MemoryStoreError, WorkingMemoryError, StructuredMemoryError) as e:
         print(f"[エラー] {e}")
@@ -425,8 +538,11 @@ def main():
         print(f"長期状態を読み込みました（{len(session.memory_state)}項目）。")
     if session.memory_pending:
         unresolved = len(session.unresolved_pending())
-        resolved = len(session.memory_pending) - unresolved
-        if resolved:
+        reverted = sum(1 for p in session.memory_pending if p["status"] == PENDING_STATUS_REVERTED)
+        resolved = len(session.memory_pending) - unresolved - reverted
+        if reverted:
+            print(f"長期保留を読み込みました（未解決 {unresolved}件、解決済み {resolved}件、取り消し済み {reverted}件）。")
+        elif resolved:
             print(f"長期保留を読み込みました（未解決 {unresolved}件、解決済み {resolved}件）。")
         else:
             print(f"長期保留を読み込みました（{unresolved}件）。")

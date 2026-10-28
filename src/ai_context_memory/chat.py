@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from .confirmation import (
     APPROVAL_INPUTS,
+    CONFIRMATION_ID_PATTERN,
     EVENT_APPLIED,
     EVENT_APPROVAL,
     EVENT_CANCELLED,
@@ -46,6 +47,20 @@ from .memory import (
     load_memories,
     parse_candidates,
     rejection_reason,
+)
+from .revert import (
+    RevertError,
+    append_revert,
+    complete_revert,
+    load_reverts,
+    next_revert_id,
+    plan_revert,
+    reconcile_revert,
+    revert_candidates,
+    revert_events_of,
+    revert_ids,
+    revert_progress,
+    revert_prompt,
 )
 from .search import (
     MAX_ROUNDS,
@@ -131,6 +146,19 @@ class ConfirmationResult:
     warnings: list = field(default_factory=list)
 
 
+@dataclass
+class RevertResult:
+    """確定の取り消しで、y/N の入力を1つ受け取った結果。status は ConfirmationResult と同じ値
+    （applied / declined / rejected / failed）を使う。"""
+
+    status: str
+    revert_id: str
+    confirmation_id: str  # 取り消す確認
+    reason: str = None  # 取り消さなかった理由
+    plan: dict = None  # 実行した取り消しの計画
+    warnings: list = field(default_factory=list)
+
+
 class ChatSession:
     def __init__(
         self,
@@ -143,6 +171,7 @@ class ChatSession:
         memory_history_path=None,
         memory_pending_path=None,
         memory_confirmations_path=None,
+        memory_reverts_path=None,
     ):
         """history_path へは会話原文を追記するだけで、読み戻さない。
 
@@ -155,6 +184,9 @@ class ChatSession:
         memory_confirmations_path を渡すと、保留の確認（/confirm）を使えるようにし、確認ログを読み込む。
         変更計画を書いたまま結果が書かれていない確認があれば、会話を始める前にここで片付ける
         （片付けられなければ ConfirmationError で起動を止める）。
+        memory_reverts_path を渡すと、確定の取り消し（/revert）を使えるようにし、取り消しログを読み込む。
+        確認と同じく、変更計画を書いたまま結果が書かれていない取り消しを、会話を始める前に片付ける
+        （片付けられなければ RevertError で起動を止める）。
         """
         self.llm = llm
         self.history_path = history_path
@@ -180,11 +212,18 @@ class ChatSession:
         self.prepared_confirmation = None  # 質問を決めて prepared を書き、出力の成功を待っている
         self.active_confirmation = None  # 質問の出力処理が正常に終わり、回答を待っている
         self.awaiting_approval = None  # 置換の実行前の y/N を待っている
+        self.memory_reverts_path = memory_reverts_path
+        self.reverts = load_reverts(memory_reverts_path) if memory_reverts_path else []
+        # 取り消しの途中の状態も、確認と同じくプロセス内だけに持つ
+        self.prepared_revert = None  # 変更内容を決めて prepared を書き、出力の成功を待っている
+        self.awaiting_revert = None  # 変更内容の出力処理が正常に終わり、y/N を待っている
         # 反映の途中で失敗して復旧できなかったときの理由。設定されている間は長期状態を書き換えない
         self.write_blocked = None
         self.startup_messages = []
         if memory_confirmations_path and memory_state_path and memory_pending_path:
             self._recover_confirmations()
+        if self._revert_ready():
+            self._recover_reverts()
 
     # --- 保留の確認 ---
 
@@ -193,6 +232,10 @@ class ChatSession:
 
     def _pending(self, pending_id):
         return next((p for p in self.memory_pending if p["id"] == pending_id), None)
+
+    def _history(self):
+        """長期状態の変更履歴を読み込む。保存先が無ければ空。読めなければ StructuredMemoryError。"""
+        return load_memory_history(self.memory_history_path) if self.memory_history_path else []
 
     def _log(self, name, confirmation_id, pending_id, **fields):
         """確認ログへイベントを追記し、追記できたものだけをメモリ上にも持つ。"""
@@ -218,14 +261,19 @@ class ChatSession:
         呼び出し側は、保存できなかった発言を使って確認を進めない。
         途中まで書かれた行を取り除けなかったときは、以後は長期状態を書き換えない。
         """
+        return self._append_conversation(
+            {
+                "role": role,
+                "content": content,
+                "confirmation_id": confirmation_id,
+                "confirmation_event": confirmation_event,
+            }
+        )
+
+    def _append_conversation(self, entry):
+        """確認・取り消しの発言1行を会話原文へ追記する。失敗したら HistoryError を、成功したら None を返す。"""
         if not self.history_path:
             return None
-        entry = {
-            "role": role,
-            "content": content,
-            "confirmation_id": confirmation_id,
-            "confirmation_event": confirmation_event,
-        }
         try:
             append_history(self.history_path, [entry])
         except HistoryError as e:
@@ -311,6 +359,10 @@ class ChatSession:
         if self.prepared_confirmation:
             # 前の準備が出力されないまま残っていれば、表示しなかったものとして閉じる
             self.abandon_prepared("出力されないまま、次の確認が始められました")
+        if self.prepared_revert:
+            self.abandon_prepared_revert("出力されないまま、確認が始められました")
+        if self.awaiting_revert:
+            raise ConfirmationError("取り消しの承認を待っているため、確認できません")
         if not self.memory_confirmations_path or not self.memory_state_path or not self.memory_pending_path:
             raise ConfirmationError("確認ログ・長期状態・長期保留の保存先が設定されていないため、確認できません")
         if self.write_blocked:
@@ -497,8 +549,8 @@ class ChatSession:
             problem = self._fresh_problem(waiting)
             if problem is None:
                 try:
-                    plan = plan_resolution(outcome, pending, self.memory_state, timestamp_now())
-                except ConfirmationError as e:
+                    plan = plan_resolution(outcome, pending, self.memory_state, timestamp_now(), self._history())
+                except StructuredMemoryError as e:
                     problem = str(e)
             if problem:
                 outcome = None
@@ -584,8 +636,8 @@ class ChatSession:
         if problem is None:
             pending = self._pending(pending_id)
             try:
-                plan = plan_resolution(OUTCOME_REPLACE, pending, self.memory_state, timestamp_now())
-            except ConfirmationError as e:
+                plan = plan_resolution(OUTCOME_REPLACE, pending, self.memory_state, timestamp_now(), self._history())
+            except StructuredMemoryError as e:
                 problem = str(e)
         if problem:
             try:
@@ -657,8 +709,300 @@ class ChatSession:
             return ConfirmationResult(CONFIRMATION_APPLIED, confirmation_id, pending_id, plan=plan, warnings=warnings)
         return ConfirmationResult(CONFIRMATION_FAILED, confirmation_id, pending_id, reason=str(error), warnings=warnings)
 
+    # --- 確定の取り消し ---
+
+    def _revert_ready(self):
+        return bool(
+            self.memory_reverts_path
+            and self.memory_confirmations_path
+            and self.memory_state_path
+            and self.memory_history_path
+            and self.memory_pending_path
+        )
+
+    def _revert_log(self, name, revert_id, confirmation_id, **fields):
+        """取り消しログへイベントを追記し、追記できたものだけをメモリ上にも持つ。"""
+        event = {
+            "event": name,
+            "revert_id": revert_id,
+            "target_confirmation_id": confirmation_id,
+            "timestamp": timestamp_now(),
+            **fields,
+        }
+        try:
+            append_revert(self.memory_reverts_path, event)
+        except PartialWriteError as e:
+            # 取り消しログの末尾が壊れている可能性があるので、以後は長期状態を書き換えない
+            self.write_blocked = str(e)
+            raise RevertError(str(e)) from e
+        self.reverts.append(event)
+        return event
+
+    def _revert_log_quietly(self, name, waiting, warnings=None, **fields):
+        try:
+            self._revert_log(name, waiting["revert_id"], waiting["confirmation_id"], **fields)
+        except RevertError as e:
+            if warnings is not None:
+                warnings.append(str(e))
+
+    def _recover_reverts(self):
+        """前回の起動で終わらなかった取り消しを片付ける。Claude は呼ばない。
+
+        変更計画を書いた取り消しは、現在値の全体が計画の実行後なら残りを実行して applied、実行前なら failed にする。
+        表示・承認の途中で終わった取り消しは、続きを行わないことを expired として記録する。
+        """
+        for revert_id in revert_ids(self.reverts):
+            events = revert_events_of(self.reverts, revert_id)
+            stage = revert_progress(events)
+            confirmation_id = events[0]["target_confirmation_id"]
+            if stage == "committed":
+                plan = [e for e in events if e["event"] == EVENT_COMMIT][-1]["plan"]
+                result, self.memory_state, self.memory_pending = reconcile_revert(
+                    plan,
+                    self.memory_state,
+                    self.memory_pending,
+                    self.memory_state_path,
+                    self.memory_history_path,
+                    self.memory_pending_path,
+                )
+                self._revert_log(result, revert_id, confirmation_id, recovered=True)
+                done = "続きを実行して取り消しました" if result == EVENT_APPLIED else "反映されていなかったため、取り消しませんでした"
+                self.startup_messages.append(f"{revert_id}（確認 {confirmation_id} の取り消し）: 前回途中で止まった取り消しを確認し、{done}")
+            elif stage == "open":
+                if any(e["event"] == EVENT_PRESENTED for e in events):
+                    reason = "再起動を挟んだため、続きを行いません"
+                else:
+                    reason = "変更内容を表示した記録が無いまま終わったため、続きを行いません"
+                self._revert_log(EVENT_EXPIRED, revert_id, confirmation_id, reason=reason)
+                self.startup_messages.append(
+                    f"{revert_id}（確認 {confirmation_id} の取り消し）: 前回の取り消しは承認の前に終わったため、続きは行いません（{reason}）"
+                )
+
+    def revert_overview(self):
+        """取り消しの対象になりうる確認ごとに、(確認 ID, 確認の変更計画, 取り消せない理由か None) を返す。"""
+        if not self._revert_ready():
+            raise RevertError("取り消しログ・確認ログ・長期状態・変更履歴・長期保留の保存先が設定されていないため、取り消せません")
+        return revert_candidates(
+            self.confirmations, self.reverts, self.memory_state, self._history(), self.memory_pending
+        )
+
+    def pending_reverts(self, pending_id):
+        """その保留を解決した確認についての、取り消しログのイベント。"""
+        confirmation_ids_ = {e["confirmation_id"] for e in self.confirmations if e["pending_id"] == pending_id}
+        return [e for e in self.reverts if e["target_confirmation_id"] in confirmation_ids_]
+
+    def _files_problem(self):
+        """ファイル上の長期状態・長期保留が、このセッションの持っている内容と同じか。違えば理由を返す。"""
+        try:
+            if load_memory_state(self.memory_state_path) != self.memory_state:
+                return "長期状態ファイルが、このセッションの外で変更されています"
+            if load_memory_pending(self.memory_pending_path) != self.memory_pending:
+                return "長期保留ファイルが、このセッションの外で変更されています"
+        except StructuredMemoryError as e:
+            return f"ファイルを確かめられません: {e}"
+        return None
+
+    def _plan_revert(self, revert_id, confirmation_id):
+        """取り消しの計画を、今の状態から作る。取り消せなければ RevertError（理由つき）。"""
+        problem = self._files_problem()
+        if problem:
+            raise RevertError(problem)
+        try:
+            history = self._history()
+        except StructuredMemoryError as e:
+            raise RevertError(f"変更履歴が読めないため、取り消せません（{e}）") from e
+        return plan_revert(
+            revert_id,
+            confirmation_id,
+            self.confirmations,
+            self.reverts,
+            self.memory_state,
+            history,
+            self.memory_pending,
+            timestamp_now(),
+        )
+
+    def start_revert(self, confirmation_id):
+        """確認 confirmation_id の取り消しを準備し、表示する内容を dict で返す。始められなければ RevertError。
+
+        取り消せるかを確かめて計画を作り、y/N の文面を決めて、取り消しログへ prepared を書く（書けなければ表示しない）。
+        ここではまだ y/N を待たない。呼び出し側は文面を出力し、出力処理が正常に終わったときだけ mark_revert_presented を、
+        失敗したときは abandon_prepared_revert を呼ぶ。
+        """
+        if self.prepared_revert:
+            self.abandon_prepared_revert("出力されないまま、次の取り消しが始められました")
+        if self.prepared_confirmation:
+            self.abandon_prepared("出力されないまま、取り消しが始められました")
+        if not self._revert_ready():
+            raise RevertError("取り消しログ・確認ログ・長期状態・変更履歴・長期保留の保存先が設定されていないため、取り消せません")
+        if self.write_blocked:
+            raise RevertError(f"長期状態の書き込みを停止しているため、取り消せません（{self.write_blocked}）。再起動してください")
+        if self.active_confirmation or self.awaiting_approval or self.awaiting_revert:
+            raise RevertError("ほかの確認・取り消しの途中のため、取り消せません")
+        if not CONFIRMATION_ID_PATTERN.fullmatch(confirmation_id or ""):
+            raise RevertError(f"確認の ID の形式が不正です: {confirmation_id}（例: /revert c001）。一覧は /revert")
+        if self.history_path:
+            try:
+                # 会話原文に途中までの行などが残っていれば、その後ろに取り消しの記録を足さない
+                load_history(self.history_path)
+            except HistoryError as e:
+                raise RevertError(f"会話原文が読めないため、取り消せません（{e}）") from e
+        revert_id = next_revert_id(self.reverts)
+        plan = self._plan_revert(revert_id, confirmation_id)
+        prompt = revert_prompt(plan)
+        self._revert_log(EVENT_PREPARED, revert_id, confirmation_id, plan=plan, prompt=prompt)
+        self.prepared_revert = {"revert_id": revert_id, "confirmation_id": confirmation_id, "prompt": prompt}
+        return {"revert_id": revert_id, "confirmation_id": confirmation_id, "plan": plan, "prompt": prompt}
+
+    def mark_revert_presented(self, revert_id):
+        """y/N の文面の出力処理が正常に終わったあとに呼ぶ。presented を書き、会話原文へ残し、y/N 待ちにする。
+
+        presented を書けない、または会話原文に文面を保存できなければ RevertError で、y/N を待たない。
+        """
+        prepared = self.prepared_revert
+        if prepared is None or prepared["revert_id"] != revert_id:
+            raise RevertError(f"表示を記録する取り消し {revert_id} が準備されていません")
+        self.prepared_revert = None
+        try:
+            self._revert_log(EVENT_PRESENTED, revert_id, prepared["confirmation_id"], prompt=prepared["prompt"])
+        except RevertError as e:
+            raise RevertError(f"変更内容を表示したことを記録できなかったため、取り消しを中止しました（{e}）") from e
+        error = self._append_conversation(
+            {"role": "assistant", "content": prepared["prompt"], "revert_id": revert_id, "revert_event": EVENT_PRESENTED}
+        )
+        if error:
+            self._revert_log_quietly(EVENT_CANCELLED, prepared, reason=f"会話原文に変更内容を保存できませんでした: {error}")
+            raise RevertError(f"会話原文に変更内容を保存できなかったため、取り消しを中止しました（{error}）") from error
+        self.awaiting_revert = dict(prepared)
+
+    def abandon_prepared_revert(self, reason):
+        """準備した文面を出力できなかったときに呼ぶ。y/N を待たず、取り消しを記録し、警告メッセージを返す。"""
+        prepared = self.prepared_revert
+        self.prepared_revert = None
+        if prepared is None:
+            return []
+        warnings = []
+        # 書けなくても、prepared だけが残り、次の起動時に expired になる
+        self._revert_log_quietly(EVENT_CANCELLED, prepared, warnings, reason=reason)
+        return warnings
+
+    def cancel_revert(self, reason):
+        """y/N を待っている取り消しを、実行せずに閉じる。警告メッセージを返す。待っていなければ何もしない。"""
+        warnings = self.abandon_prepared_revert(reason)
+        waiting = self.awaiting_revert
+        self.awaiting_revert = None
+        if waiting:
+            self._revert_log_quietly(EVENT_CANCELLED, waiting, warnings, reason=reason)
+        return warnings
+
+    def approve_revert(self, user_text):
+        """取り消しの y/N への入力を受け取り、RevertResult を返す。y（Y）のときだけ実行する。
+
+        入力は会話原文に保存できたときだけ使う（保存できなければ y でも実行しない）。
+        y なら、今の状態から計画を作り直し、表示した文面と同じ内容になるときだけ、承認を書いてから実行する。
+        """
+        waiting = self.awaiting_revert
+        self.awaiting_revert = None
+        revert_id, confirmation_id = waiting["revert_id"], waiting["confirmation_id"]
+        approved = user_text.strip() in APPROVAL_INPUTS
+        error = self._append_conversation(
+            {"role": "user", "content": user_text, "revert_id": revert_id, "revert_event": EVENT_APPROVAL}
+        )
+        if error:
+            # 承認の入力を残せなければ、approval を書かず、y でも実行しない（再起動後も承認として扱わない）
+            self._revert_log_quietly(EVENT_CANCELLED, waiting, reason=f"承認の入力を会話原文に保存できませんでした: {error}")
+            return RevertResult(
+                CONFIRMATION_FAILED,
+                revert_id,
+                confirmation_id,
+                reason=f"承認の入力を会話原文に保存できなかったため、取り消しませんでした（{error}）",
+            )
+        warnings = []
+        plan = None
+        problem = None
+        if approved:
+            try:
+                plan = self._plan_revert(revert_id, confirmation_id)
+            except StructuredMemoryError as e:
+                problem = str(e)
+            else:
+                if revert_prompt(plan) != waiting["prompt"]:
+                    problem = "変更内容を表示した後に状態が変わったため、表示した内容のとおりには取り消せません"
+        try:
+            self._revert_log(EVENT_APPROVAL, revert_id, confirmation_id, prompt=waiting["prompt"], input=user_text, approved=approved)
+        except RevertError as e:
+            return RevertResult(CONFIRMATION_FAILED, revert_id, confirmation_id, reason=str(e))
+        if not approved:
+            return RevertResult(CONFIRMATION_DECLINED, revert_id, confirmation_id)
+        if problem:
+            self._revert_log_quietly(EVENT_FAILED, waiting, warnings, error=problem)
+            return RevertResult(CONFIRMATION_REJECTED, revert_id, confirmation_id, reason=problem, warnings=warnings)
+        return self._commit_revert(revert_id, confirmation_id, plan, warnings)
+
+    def _commit_revert(self, revert_id, confirmation_id, plan, warnings):
+        """取り消しの計画を取り消しログへ書いてから実行する。途中で失敗したら、その場で1回だけ復旧を試みる。"""
+        waiting = {"revert_id": revert_id, "confirmation_id": confirmation_id}
+        if self.write_blocked:
+            reason = f"長期状態の書き込みを停止しているため、取り消しませんでした（{self.write_blocked}）"
+            self._revert_log_quietly(EVENT_FAILED, waiting, warnings, error=reason)
+            return RevertResult(CONFIRMATION_FAILED, revert_id, confirmation_id, reason=reason, warnings=warnings)
+        try:
+            self._revert_log(EVENT_COMMIT, revert_id, confirmation_id, plan=plan)
+        except RevertError as e:
+            return RevertResult(CONFIRMATION_FAILED, revert_id, confirmation_id, reason=str(e), warnings=warnings)
+        try:
+            state, pending = complete_revert(
+                plan,
+                self.memory_state,
+                self.memory_pending,
+                self.memory_state_path,
+                self.memory_history_path,
+                self.memory_pending_path,
+            )
+        except StructuredMemoryError as e:
+            return self._recover_revert_after_failure(revert_id, confirmation_id, plan, e, warnings)
+        self.memory_state, self.memory_pending = state, pending
+        try:
+            self._revert_log(EVENT_APPLIED, revert_id, confirmation_id)
+        except RevertError as e:
+            warnings.append(f"{e}（取り消しは反映済みです。次の起動時に取り消しログへ記録を補います）")
+        return RevertResult(CONFIRMATION_APPLIED, revert_id, confirmation_id, plan=plan, warnings=warnings)
+
+    def _recover_revert_after_failure(self, revert_id, confirmation_id, plan, error, warnings):
+        """取り消しの途中の失敗のあと、ファイルを読み直して片付ける。片付けられなければ長期状態の書き込みを止める。"""
+        try:
+            state = load_memory_state(self.memory_state_path)
+            pending = load_memory_pending(self.memory_pending_path)
+            result, state, pending = reconcile_revert(
+                plan,
+                state,
+                pending,
+                self.memory_state_path,
+                self.memory_history_path,
+                self.memory_pending_path,
+            )
+            self._revert_log(result, revert_id, confirmation_id, recovered=True, error=str(error))
+        except StructuredMemoryError as e:
+            self.write_blocked = f"{revert_id} の取り消しが途中で止まりました: {e}"
+            return RevertResult(
+                CONFIRMATION_FAILED,
+                revert_id,
+                confirmation_id,
+                reason=f"{error}。続きも実行できませんでした（{e}）。長期状態の書き込みを停止しました。再起動してください",
+                warnings=warnings,
+            )
+        self.memory_state, self.memory_pending = state, pending
+        if result == EVENT_APPLIED:
+            warnings.append(f"取り消しの途中で失敗しましたが、続きを実行して取り消しました: {error}")
+            return RevertResult(CONFIRMATION_APPLIED, revert_id, confirmation_id, plan=plan, warnings=warnings)
+        return RevertResult(CONFIRMATION_FAILED, revert_id, confirmation_id, reason=str(error), warnings=warnings)
+
     def _with_confirmation_texts(self, events):
-        """変更履歴のイベントに、確認ログから質問・回答・承認の原文を付けたコピーを返す（回答AIに渡すため）。"""
+        """変更履歴のイベントに、確認ログから質問・回答・承認の原文を付けたコピーを返す（回答AIに渡すため）。
+
+        取り消し（revert）のイベントは confirmation_id を持たないので、取り消した確認の質問・回答は付かない。
+        代わりに、取り消しログから取り消しの承認の入力を付ける。
+        """
         texts = {}
         for event in self.confirmations:
             entry = texts.setdefault(event["confirmation_id"], {})
@@ -668,7 +1012,18 @@ class ChatSession:
                 entry["confirmation_answer"] = event.get("answer")
             elif event["event"] == EVENT_APPROVAL and event.get("approved"):
                 entry["approval_input"] = event.get("input")
-        return [{**event, **texts.get(event.get("confirmation_id"), {})} for event in events]
+        revert_inputs = {
+            event["revert_id"]: event.get("input")
+            for event in self.reverts
+            if event["event"] == EVENT_APPROVAL and event.get("approved")
+        }
+        result = []
+        for event in events:
+            event = {**event, **texts.get(event.get("confirmation_id"), {})}
+            if event.get("revert_id") in revert_inputs:
+                event["revert_approval_input"] = revert_inputs[event["revert_id"]]
+            result.append(event)
+        return result
 
     def retrieve(self, user_text):
         """ユーザー発話に答えるために必要な長期記憶と2つの変更履歴を検索し、Retrieval を返す。

@@ -63,7 +63,10 @@ ENDING_EXPRESSIONS = (
 PENDING_STATUS_UNRESOLVED = "unresolved"
 # 確認によって解決した保留。解決の内容は resolution / resolved_key / resolved_at / confirmation_id に残す
 PENDING_STATUS_RESOLVED = "resolved"
-PENDING_STATUSES = (PENDING_STATUS_UNRESOLVED, PENDING_STATUS_RESOLVED)
+# 解決した確認が /revert で取り消された保留。解決の記録はそのまま残し、取り消しは reverted_by / reverted_at に残す。
+# 発言は撤回されていないので、同じ発言の新しい保留（reopened_from がこの保留の id）を作る
+PENDING_STATUS_REVERTED = "reverted"
+PENDING_STATUSES = (PENDING_STATUS_UNRESOLVED, PENDING_STATUS_RESOLVED, PENDING_STATUS_REVERTED)
 # 保留の1項目が持つキー（保存する順）。id / subject / evidence / created_at は必須、それ以外は文字列か null
 PENDING_KEYS = (
     "id",
@@ -84,6 +87,10 @@ PENDING_KEYS = (
     "resolved_key",
     "resolved_at",
     "confirmation_id",
+    "reverted_by",
+    "reverted_at",
+    "reopened_from",
+    "reopened_by",
 )
 PENDING_REQUIRED_KEYS = ("id", "subject", "evidence", "created_at")
 
@@ -138,10 +145,15 @@ def related_memory_state(items, found):
     return list(found) + extra
 
 
-def next_numbered_key(items, subject, key):
-    """key と同じ属性の値を新しく持たせるための、まだ使われていない番号付きの key を返す。"""
+def next_numbered_key(items, subject, key, history=()):
+    """key と同じ属性の値を新しく持たせるための、まだ使われていない番号付きの key を返す。
+
+    history（変更履歴のイベント）に現れる key も使用済みとする。取り消しで現在値から外した key を
+    別の値に使い回すと、変更履歴の同じ key のイベントがどの値のものか分からなくなるため。
+    """
     base = attribute_base(key)
     used = {item["key"] for item in items if item["subject"] == subject}
+    used |= {event.get("key") for event in history if event.get("subject") == subject}
     number = 2
     while f"{base}_{number}" in used:
         number += 1

@@ -135,6 +135,7 @@ def main_env(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE", str(tmp_path / "long_term_memory_confirmations.jsonl")
     )
+    monkeypatch.setenv("ACM_LONG_TERM_MEMORY_REVERTS_FILE", str(tmp_path / "long_term_memory_reverts.jsonl"))
     monkeypatch.setattr(cli, "ClaudeCLI", EchoLLM)
     monkeypatch.setattr(cli.sys, "stdin", FakeStdin("exit\n"))
     monkeypatch.setattr(cli.sys.stdout, "reconfigure", lambda **kwargs: None, raising=False)

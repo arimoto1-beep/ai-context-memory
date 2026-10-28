@@ -146,6 +146,11 @@ NAGOYA_PENDING = {
     "resolved_key": None,
     "resolved_at": None,
     "confirmation_id": None,
+    # MVP11: 確定の取り消しの記録
+    "reverted_by": None,
+    "reverted_at": None,
+    "reopened_from": None,
+    "reopened_by": None,
 }
 
 
@@ -1163,6 +1168,7 @@ def main_env(tmp_path, monkeypatch):
         "ACM_LONG_TERM_MEMORY_HISTORY_FILE": "state_history.jsonl",
         "ACM_LONG_TERM_MEMORY_PENDING_FILE": "pending.json",
         "ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE": "confirmations.jsonl",
+        "ACM_LONG_TERM_MEMORY_REVERTS_FILE": "reverts.jsonl",
     }
     for name, filename in names.items():
         monkeypatch.setenv(name, str(tmp_path / filename))

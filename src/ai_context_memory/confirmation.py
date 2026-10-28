@@ -19,6 +19,7 @@ from .structured_memory import (
     OP_ADD,
     OP_REPLACE,
     PENDING_STATUS_RESOLVED,
+    PENDING_STATUS_REVERTED,
     PENDING_STATUS_UNRESOLVED,
     SUBJECT_USER,
     StructuredMemoryError,
@@ -202,6 +203,8 @@ def _parse_time(text):
 
 def resolution_problem(pending, items):
     """保留を確認して解決できれば None、できなければその理由を返す。"""
+    if pending.get("status") == PENDING_STATUS_REVERTED:
+        return f"{pending['id']} は、解決した確認を取り消した保留です（同じ発言は、取り消しで作った新しい保留で確認できます）"
     if pending.get("status") != PENDING_STATUS_UNRESOLVED:
         return f"{pending['id']} は既に解決済みです"
     if pending.get("subject") != SUBJECT_USER:
@@ -314,11 +317,12 @@ def snapshot(item):
     return {"value": item["value"], "updated_at": item.get("updated_at")}
 
 
-def plan_resolution(outcome, pending, items, timestamp):
+def plan_resolution(outcome, pending, items, timestamp, history=()):
     """共存・置換の変更計画を作る。実行はしない。計画を作れなければ ConfirmationError。
 
     計画には、実行前（before）と実行後（after）の対象項目を入れる。
     復旧するときに、現在値がどちらと同じかで、どこまで実行したかを決めるため。
+    history は変更履歴のイベントで、共存の番号付きの key に、過去に使った番号を使わないために渡す。
     """
     subject, target_key = pending["subject"], pending["target_key"]
     value = pending["proposed_value"].strip()
@@ -348,7 +352,7 @@ def plan_resolution(outcome, pending, items, timestamp):
     if existing is not None:
         # 同じ属性に同じ値が既にあれば、現在値は変えずに保留だけを解決する（重複を作らない）
         return {**base, "operation": None, "key": existing["key"], "value": value, "resolved_key": existing["key"]}
-    key = next_numbered_key(items, subject, target_key)
+    key = next_numbered_key(items, subject, target_key, history)
     if len(key) > MAX_KEY_LENGTH or not KEY_PATTERN.fullmatch(key):
         raise ConfirmationError(f"共存させる値の key を作れません: {key}")
     return {
@@ -431,6 +435,8 @@ def complete_plan(confirmation_id, plan, state, pending_items, state_path, histo
                 f"{confirmation_id}: 保留 {pending['id']} は別の確認（{pending.get('confirmation_id')}）で解決されています"
             )
         return state, pending_items
+    if pending["status"] != PENDING_STATUS_UNRESOLVED:
+        raise ConfirmationError(f"{confirmation_id}: 保留 {pending['id']} は {pending['status']} のため解決できません")
     resolved = {
         **pending,
         "status": PENDING_STATUS_RESOLVED,
