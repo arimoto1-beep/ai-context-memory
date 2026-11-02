@@ -877,13 +877,17 @@ def test_system_prompt_does_not_let_old_current_value_decide_alone():
 
 
 def test_system_prompt_separates_the_new_statement_the_old_value_and_the_unknown_relation():
-    """MVP9 仕上げ A. 新しい発言・以前の値・未確認の関係を区別し、以前の値を先に強調しない。"""
+    """MVP9 仕上げ A. 新しい発言・以前の値・未確認の関係を区別する。
+
+    MVP12 で、順序の制限（以前の値を先に強調しない）を外し、新しい発言を軽く扱わない制約だけを残した。
+    """
     system = llm_module.SYSTEM_PROMPT
 
-    assert "関係する保留があるときは、次の3つを区別して伝えてください。" in system
+    assert "関係する保留があるときは、記憶の状態として次の3つを区別して伝えてください。" in system
     assert "保留の内容は、ユーザー自身の発言として伝えてください（例: 「〜と伺っています」）。" in system
     assert "ユーザーが新しく述べたことそのものではありません。" in system
-    assert "以前から記録されている値を確かな情報として先に強調し、新しい発言を補足のように扱うことはしないでください。" in system
+    assert "確認待ちの発言を、保存済みの記憶への補足や注記のように軽く扱わないでください。" in system
+    assert "先に強調し" not in system
     # 保留を常に優先する指示にはしない
     assert "保留の値を、確定した現在の値として扱わないでください。" in system
 

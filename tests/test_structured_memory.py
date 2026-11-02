@@ -1295,7 +1295,8 @@ def test_system_prompt_says_current_state_wins_over_legacy_memories():
     system = llm_module.SYSTEM_PROMPT
 
     assert "[long-term memory state]" in system
-    assert "これは現在有効な値です。" in system
+    # MVP12: 現在値は「保存済みの記憶」で、現実の今の状態を保証しない
+    assert "これは保存済みの記憶の現在の値で、その後に置き換わったことが確認されていないものです。" in system
     assert "その後に値が変わる前の古い情報が混ざっていることがあります。" in system
     assert (
         "[long-term memory state] と [retrieved memories] が矛盾する場合は、"
