@@ -14,7 +14,7 @@ import re
 from datetime import datetime
 
 from .memory import strip_code_fence
-from .search import normalize
+from .search import MAX_RESULTS, normalize
 
 # 今回扱う subject はユーザー自身だけ
 SUBJECT_USER = "user"
@@ -131,18 +131,60 @@ def same_attribute_items(items, subject, key):
     return [item for item in items if item["subject"] == subject and attribute_base(item["key"]) == base]
 
 
-def related_memory_state(items, found):
-    """検索でヒットした現在値に、同じ属性の項目（番号付きの key など）を足して返す。
+def attribute_of(subject, key):
+    """属性を表す (subject, 番号の無い key)。番号付きの key（home_location_2）は、番号の無い key と同じ属性。"""
+    return subject, attribute_base(key)
+
+
+def pending_attributes(pending):
+    """保留が関係する属性（target_key と proposed_key のもの）を、重複なく返す。"""
+    return list(
+        dict.fromkeys(attribute_of(pending["subject"], pending[k]) for k in ("target_key", "proposed_key") if pending.get(k))
+    )
+
+
+def related_memory_state(items, found, attributes=()):
+    """検索でヒットした現在値に、同じ属性の項目（番号付きの key など）と、attributes の属性の項目を足して返す。
 
     同じ属性に値が複数あるとき、回答AIがどれか1つだけを見て断定しないようにするため。並びはヒットした順の後に保存順。
     """
-    groups = {(item["subject"], attribute_base(item["key"])) for item in found}
+    groups = {attribute_of(item["subject"], item["key"]) for item in found} | set(attributes)
     extra = [
         item
         for item in items
-        if (item["subject"], attribute_base(item["key"])) in groups and item not in found
+        if attribute_of(item["subject"], item["key"]) in groups and item not in found
     ]
     return list(found) + extra
+
+
+def related_memory_pending(items, attributes, found=(), limit=MAX_RESULTS):
+    """回答に渡す保留を、保存順で limit 件まで返す。
+
+    attributes の属性に target_key か proposed_key でつながる保留（番号付きの key も同じ属性）を優先して選び、
+    残りを found（検索語でヒットした保留）から選ぶ。つながる保留が limit を超える場合は、新しく保存されたものを残す。
+    """
+    attributes = set(attributes)
+    linked = [p for p in reversed(items) if attributes.intersection(pending_attributes(p))]
+    chosen = []
+    for pending in linked + list(found):
+        if pending not in chosen and len(chosen) < limit:
+            chosen.append(pending)
+    return [p for p in items if p in chosen]
+
+
+def attribute_history(events, attribute, limit):
+    """変更履歴から、属性のイベント（番号付きの key のものも含む）を古い順に limit 件まで返す。
+
+    戻り値は (イベントのリスト, その属性のイベントの全件数)。limit を超える場合は新しいほうを残す。
+    """
+    matched = [
+        event
+        for event in events
+        if isinstance(event.get("subject"), str)
+        and isinstance(event.get("key"), str)
+        and attribute_of(event["subject"], event["key"]) == attribute
+    ]
+    return (matched[-limit:] if limit > 0 else []), len(matched)
 
 
 def next_numbered_key(items, subject, key, history=()):
@@ -560,7 +602,7 @@ def append_memory_history(path, changes, timestamp):
 def load_memory_history(path):
     """履歴ファイルを全イベント読み込む。ファイルが無ければ空のリストを返す。
 
-    回答用のLLMへは、ここから検索でヒットしたイベントだけを渡す。
+    回答用のLLMへは、ここから検索でヒットした属性のイベントだけを渡す（attribute_history）。
     """
     try:
         with open(path, encoding="utf-8-sig") as f:

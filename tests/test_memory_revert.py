@@ -1122,7 +1122,9 @@ def test_answer_ai_sees_the_revert_apart_from_the_original_answer(paths):
 
     prompt = llm.prompts[-1]
     block = prompt.split("[long-term memory history]\n")[1].split("\n[/long-term memory history]")[0]
-    confirmed, reverted = block.split("\n\n")
+    scope, confirmed, reverted = block.split("\n\n")
+    # 置換を確定した確認と取り消しは、同じ属性のイベントとしてまとめて渡る（MVP13）
+    assert scope == "attribute: user.home_location (events: 2 of 2, complete)"
     # 元の確認のイベントには、その確認の質問・回答が付く
     assert "confirmation_answer: いいえ、もうありません。" in confirmed
     # 取り消しのイベントには、元の確認の質問・回答を付けない（取り消しの根拠と誤解させないため）

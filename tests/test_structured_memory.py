@@ -28,6 +28,7 @@ from ai_context_memory.search import (
     SearchPlan,
     SearchPlanError,
     parse_plan,
+    rank_memory_history,
     search_memory_history,
     search_memory_state,
     search_working_memory_history,
@@ -156,6 +157,7 @@ REPLACE_APPLE_ENTRY = (
     "  value: りんご\n"
     f"  evidence: {APPLE_TEXT}"
 )
+FRUIT_SCOPE_LINE = "attribute: user.favorite_fruit (events: 2 of 2, complete)"
 FRUIT_HISTORY_BLOCK = (
     "[long-term memory history]\n"
     f"{ADD_PEAR_ENTRY}\n\n{REPLACE_APPLE_ENTRY}\n"
@@ -272,9 +274,9 @@ def history_searches(monkeypatch):
 
     def spy(events, queries, *args, **kwargs):
         calls.append(list(queries))
-        return search_memory_history(events, queries, *args, **kwargs)
+        return rank_memory_history(events, queries, *args, **kwargs)
 
-    monkeypatch.setattr(chat_module, "search_memory_history", spy)
+    monkeypatch.setattr(chat_module, "rank_memory_history", spy)
     return calls
 
 
@@ -1068,8 +1070,8 @@ def test_only_hit_items_are_sent_not_the_whole_state(saved):
     assert "りんご" not in llm.prompts[0]
 
 
-def test_past_value_question_searches_history_and_sends_only_hits(saved, history_searches):
-    """24・成功条件5: 過去値の質問では変更履歴を検索し、ヒットしたイベントだけを渡す。"""
+def test_past_value_question_searches_history_and_sends_only_hit_attributes(saved, history_searches):
+    """24・成功条件5: 過去値の質問では変更履歴を検索し、ヒットした属性のイベントだけを渡す（MVP13）。"""
     queries = ["favorite_fruit", "果物"]
     llm = FakeLLM(["以前は梨で、現在はりんごです。"], plans=[plan(["果物"], queries)])
     session = ChatSession(llm, *saved)
@@ -1078,19 +1080,22 @@ def test_past_value_question_searches_history_and_sends_only_hits(saved, history
 
     assert history_searches == [queries]
     prompt = llm.prompts[0]
-    assert block(prompt, "long-term memory history") == f"{ADD_PEAR_ENTRY}\n\n{REPLACE_APPLE_ENTRY}"
+    assert block(prompt, "long-term memory history") == (
+        f"{FRUIT_SCOPE_LINE}\n\n{ADD_PEAR_ENTRY}\n\n{REPLACE_APPLE_ENTRY}"
+    )
     # 保存されている timestamp と old_value がそのまま渡る
     assert T1 in prompt and T2 in prompt
     assert "  old_value: 梨" in prompt
-    # ヒットしなかったイベント（履歴の全文）は渡らない
+    # ヒットしなかった属性のイベント（履歴の全文）は渡らない
     assert "favorite_drink" not in prompt
     assert prompt.index(APPLE_BLOCK) < prompt.index("[long-term memory history]")
     assert prompt.index("[/long-term memory history]") < prompt.index("[retrieved memories]")
-    assert outputs[1:5] == [
+    assert outputs[1:6] == [
         "[長期履歴検索] favorite_fruit / 果物",
         "[長期履歴検索結果] 2件",
         "[検索] 果物",
         "[検索結果] 3件",
+        "[長期履歴] user.favorite_fruit 2/2件",
     ]
     # イベントの中身はCLIへ表示しない
     assert not any("old_value" in o for o in outputs)
@@ -1145,7 +1150,11 @@ def test_retry_happens_only_when_both_long_term_sources_have_no_hits(saved, hist
     assert llm.plan_inputs[1] == (
         "[question]\n今、私の好きなフルーツは？\n\n[previous queries: 0 hits]\n- フルーツ"
     )
-    assert "[long-term memory history]" not in llm.prompts[0]
+    # 変更履歴の検索語は0件でも、再検索でヒットした現在値の属性の変更履歴を渡す（MVP13）
+    assert block(llm.prompts[0], "long-term memory history") == (
+        f"{FRUIT_SCOPE_LINE}\n\n{ADD_PEAR_ENTRY}\n\n{REPLACE_APPLE_ENTRY}"
+    )
+    assert outputs[7] == "[長期履歴] user.favorite_fruit 2/2件"
     assert APPLE_BLOCK in llm.prompts[0]
 
 
@@ -1225,7 +1234,9 @@ def test_all_blocks_are_sent_in_order_with_working_memory(saved):
         "  evidence: ステージング環境はやっぱり対象外にします。\n"
         "[/working memory history]\n\n"
         f"{APPLE_BLOCK}\n\n"
-        f"{FRUIT_HISTORY_BLOCK}\n\n"
+        "[long-term memory history]\n"
+        f"{FRUIT_SCOPE_LINE}\n\n{ADD_PEAR_ENTRY}\n\n{REPLACE_APPLE_ENTRY}\n"
+        "[/long-term memory history]\n\n"
         "[retrieved memories]\n"
         f"- ユーザーの好きな果物は梨 (origin: user, evidence: {PEAR_TEXT})\n"
         f"- ユーザーは最近はりんごが好き (origin: user, evidence: {APPLE_TEXT})\n"

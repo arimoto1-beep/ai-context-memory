@@ -376,6 +376,16 @@ def normal_turn(session, user_text, output_fn, recorded=False):
         for terms, count in retrieval.memory_pending_log:
             output_fn(f"[長期保留検索] {' / '.join(terms)}")
             output_fn(f"[長期保留検索結果] {count}件")
+        scope = retrieval.memory_history_scope
+        if scope:
+            # 回答AIへ渡す変更履歴は、ヒットしたイベントではなく、検索で見つかった属性ごとのイベント（渡した件数/全件数）
+            for attribute in scope["attributes"]:
+                output_fn(
+                    f"[長期履歴] {attribute['subject']}.{attribute['key']} "
+                    f"{attribute['shown']}/{attribute['total']}件"
+                )
+            if scope["omitted_attributes"]:
+                output_fn(f"[長期履歴] ほかに {scope['omitted_attributes']} 属性の変更履歴は渡していません")
         for warning in retrieval.warnings:
             output_fn(f"[警告] {warning}")
         reply = session.send(
@@ -386,6 +396,7 @@ def normal_turn(session, user_text, output_fn, recorded=False):
             retrieval.memory_history_events,
             retrieval.memory_pending,
             recorded=recorded,
+            memory_history_scope=retrieval.memory_history_scope,
         )
     except LLMError as e:
         output_fn(f"[エラー] {e}")

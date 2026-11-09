@@ -126,9 +126,20 @@ SYSTEM_PROMPT = (
     "未確定な関係を説明するところまでにしてください。確認のための質問をする必要はありません。"
     "[retrieved memories] に保留と同じ内容があっても、それだけで確定した値として扱わないでください。"
     "会話の前に [long-term memory history] から [/long-term memory history] までのブロックが付くことがあります。"
-    "これは、ユーザーについての情報が過去にどう変わったかを、"
-    "長期記憶の変更履歴から検索で取得したイベントで、古い順に並んでいます。"
+    "これは、ユーザーについての情報が過去にどう変わったかを示す、長期記憶の変更履歴のイベントです。"
+    "検索で見つかった属性ごとに、その属性のイベントをまとめて、古い順に並べています。"
     "各イベントの1行目は、その変更が行われた日時です。"
+    "保留を確認して行った変更（pending_id があるイベント）の日時は、確認して変更した日時で、"
+    "元の発言の日時とは限りません。"
+    "各属性のイベントの前には「attribute: subject.key (events: 渡した件数 of その属性の全件数, ...)」の行があります。"
+    "番号付きの key（home_location_2 など）のイベントは、番号の無い key の属性に含めています。"
+    "complete は、その属性について記録されている変更履歴をすべて渡していることを表します。"
+    "older events omitted がある属性は、古いイベントの一部を渡していません。"
+    "渡したイベントだけで経緯がすべてそろっているように説明せず（最初にどう記録されたかなど）、"
+    "それより前の変更が省略されていることを伝えてください。"
+    "other matching attributes not included の行は、検索で見つかったが変更履歴を渡していない属性の数です。"
+    "attribute の行がある属性の保存済みの値は、[long-term memory state] にすべて含めています。"
+    "そこにその属性の項目が無ければ、その属性について今保存されている値はありません。"
     "operation は add（その属性の値が初めて記録された）、replace（値が別の値に置き換えられた）、"
     "revert（確認によって行った変更が取り消された）のいずれかです。"
     "value はそのとき新しく記録された値、old_value は replace のときにあり、置き換えられる前の値です。"
@@ -148,11 +159,19 @@ SYSTEM_PROMPT = (
     "これらは過去の値の変更の記録であって、現在の値ではありません。"
     "old_value や、後のイベントで置き換えられた value を、現在の値として扱わないでください。"
     "現在の値については、[long-term memory state] を優先してください。"
+    "今の保存状態（保存済みの値と確認待ちの保留）は、[long-term memory state] と [long-term memory pending] だけを根拠にし、"
+    "変更履歴の最後のイベントの value や reopened_pending_id から推定して言い切らないでください。"
     "以前の値や、値が変わった時期については、[long-term memory history] のイベントを根拠にし、"
     "推定としてではなく、履歴を根拠として答えてください。"
+    "変更の経緯を説明するときは、ユーザーの発言（evidence）、このシステムの確認の質問とユーザーの回答、"
+    "変更の実行の承認、取り消しを、それぞれ別の出来事として区別してください。"
+    "変更の理由として述べてよいのは、これらの記録にあることだけです。"
+    "記録に無い理由や生活の事情を推測して補わないでください。"
     "[long-term memory history] にあるのは検索で見つかったイベントだけです。そこに無い変更を補って述べないでください。"
     "以前の値について答える必要があるのに、[long-term memory history] が無い、"
     "または必要なイベントが見当たらない場合は、推測で補わず、履歴からは確認できないと伝えてください。"
+    "検索で見つからなかったことは、記憶や変更履歴が存在しないことを意味しません。"
+    "必要な記憶が見つからないときは、記録が無いと断定せず、見つけられなかったと伝えてください。"
 )
 
 SEARCH_PLAN_SYSTEM_PROMPT = (
@@ -454,39 +473,67 @@ def format_memory_state(items, with_details=True):
     return "[long-term memory state]\n" + "\n".join(lines) + "\n[/long-term memory state]"
 
 
-def format_memory_history(events):
-    """長期記憶の変更履歴のイベントを、渡された順に並べたブロックにする。イベントが無ければ空文字を返す。"""
-    if not events:
+def history_scope_line(attribute):
+    """変更履歴を渡した属性1つの見出し。その属性の全件を渡したか、古いイベントを省いたかを示す。"""
+    shown, total = attribute["shown"], attribute["total"]
+    coverage = "complete" if shown >= total else f"{total - shown} older events omitted"
+    return f"attribute: {attribute['subject']}.{attribute['key']} (events: {shown} of {total}, {coverage})"
+
+
+def format_memory_history(events, scope=None):
+    """長期記憶の変更履歴のイベントを並べたブロックにする。イベントも scope も無ければ空文字を返す。
+
+    scope（ChatSession.retrieve の memory_history_scope）があれば、属性ごとに見出しを付けてイベントをまとめ、
+    変更履歴を渡さなかった属性があればその数を最後に書く。scope が無ければ、渡された順に並べるだけ。
+    """
+    if not events and not scope:
         return ""
+    if not scope:
+        entries = [_memory_history_entry(event) for event in events]
+        return "[long-term memory history]\n" + "\n\n".join(entries) + "\n[/long-term memory history]"
     entries = []
-    for event in events:
-        lines = [f"- {event.get('timestamp', '')}"]
-        # old_value は replace と revert のイベントにだけある。確認の項目は、保留を確認して行った変更にだけある
-        # （質問と回答の原文は、検索するときに確認ログから引いて付ける）。取り消しの項目は revert のイベントにだけある
-        lines += [
-            f"  {key}: {event[key]}"
-            for key in (
-                "operation",
-                "subject",
-                "key",
-                "old_value",
-                "value",
-                "evidence",
-                "pending_id",
-                "confirmation_id",
-                "confirmation_question",
-                "confirmation_answer",
-                "approval_input",
-                "revert_id",
-                "reverted_confirmation_id",
-                "reverted_operation",
-                "reopened_pending_id",
-                "revert_approval_input",
-            )
-            if event.get(key)
+    for attribute in scope["attributes"]:
+        entries.append(history_scope_line(attribute))
+        entries += [
+            _memory_history_entry(event)
+            for event in events
+            if event.get("subject") == attribute["subject"]
+            and isinstance(event.get("key"), str)
+            and attribute_base(event["key"]) == attribute["key"]
         ]
-        entries.append("\n".join(lines))
+    if scope["omitted_attributes"]:
+        entries.append(f"other matching attributes not included: {scope['omitted_attributes']}")
     return "[long-term memory history]\n" + "\n\n".join(entries) + "\n[/long-term memory history]"
+
+
+def _memory_history_entry(event):
+    """変更履歴のイベント1つ。1行目は日時で、値のある項目だけを並べる。"""
+    lines = [f"- {event.get('timestamp', '')}"]
+    # old_value は replace と revert のイベントにだけある。確認の項目は、保留を確認して行った変更にだけある
+    # （質問と回答の原文は、検索するときに確認ログから引いて付ける）。取り消しの項目は revert のイベントにだけある
+    lines += [
+        f"  {key}: {event[key]}"
+        for key in (
+            "operation",
+            "subject",
+            "key",
+            "old_value",
+            "value",
+            "evidence",
+            "pending_id",
+            "confirmation_id",
+            "confirmation_question",
+            "confirmation_answer",
+            "approval_input",
+            "revert_id",
+            "reverted_confirmation_id",
+            "reverted_operation",
+            "reopened_pending_id",
+            "revert_approval_input",
+        )
+        if event.get(key)
+    ]
+    return "\n".join(lines)
 
 
 def format_memory_pending(items):
@@ -516,6 +563,7 @@ def format_prompt(
     memory_state=(),
     memory_history_events=(),
     memory_pending=(),
+    memory_history_scope=None,
 ):
     parts = [f"[{m['role']}]\n{m['content']}" for m in messages]
     if memories:
@@ -525,7 +573,7 @@ def format_prompt(
         )
         parts.insert(0, f"[retrieved memories]\n{lines}\n[/retrieved memories]")
     # ユーザーについての記憶は、現在値、保留、その変更履歴、従来の記憶の順に置く
-    block = format_memory_history(memory_history_events)
+    block = format_memory_history(memory_history_events, memory_history_scope)
     if block:
         parts.insert(0, block)
     block = format_memory_pending(memory_pending)
@@ -597,6 +645,7 @@ class ClaudeCLI:
         memory_state=(),
         memory_history_events=(),
         memory_pending=(),
+        memory_history_scope=None,
     ):
         """現在の会話履歴と、作業記憶、検索で取得した記憶・現在値・保留・変更履歴を渡し、アシスタントの応答テキストを返す。"""
         return self._run(
@@ -609,6 +658,7 @@ class ClaudeCLI:
                 memory_state,
                 memory_history_events,
                 memory_pending,
+                memory_history_scope,
             ),
         )
 

@@ -2,6 +2,8 @@
 
 検索対象は、長期記憶（従来の記憶と、構造化した現在値・保留）、長期記憶の変更履歴、作業記憶の変更履歴。
 どれを検索するかもAIが検索プランで決める。
+構造化した長期記憶では、検索は関係する属性を見つけるためのもので、属性に関係する記憶を集めるのは
+structured_memory の related_memory_state / related_memory_pending / attribute_history。
 """
 
 import json
@@ -14,6 +16,10 @@ MAX_QUERIES = 3  # 1回の検索プランで使う検索語の上限（検索対
 MAX_RESULTS = 5  # 通常回答用のLLMへ渡す記憶の上限（従来の記憶・構造化した現在値のそれぞれ）
 MAX_HISTORY_RESULTS = 10  # 通常回答用のLLMへ渡す変更履歴のイベントの上限（履歴ごと）
 MAX_ROUNDS = 2  # 検索プラン作成の上限（0件のときの再検索は1回だけ）
+# 構造化した長期記憶は、検索でヒットした属性（subject と番号の無い key）を起点に、その属性の現在値・保留・変更履歴を集める
+MAX_ATTRIBUTES = 5  # 現在値と保留を集める属性の上限
+MAX_HISTORY_ATTRIBUTES = 3  # そのうち、変更履歴を渡す属性の上限
+MAX_ATTRIBUTE_HISTORY_EVENTS = 10  # 1つの属性について渡す変更履歴のイベントの上限（超えたら古いほうを省く）
 
 # 作業記憶の変更履歴のイベントのうち、検索対象にする項目
 HISTORY_SEARCH_KEYS = ("operation", "field", "text", "target", "evidence")
@@ -157,6 +163,17 @@ def search_memory_history(events, queries, limit=MAX_HISTORY_RESULTS):
     return _search_events(events, queries, MEMORY_HISTORY_SEARCH_KEYS, limit)
 
 
+def rank_memory_history(events, queries):
+    """検索語のどれかにヒットした長期記憶の変更履歴のイベントを、すべて順位順で返す。
+
+    ヒットの判定とスコアは search_memory_history と同じ。並びはスコアの高い順で、同点なら新しいイベントが先。
+    回答AIへ渡すイベントを選ぶためではなく、関係する属性を見つけるために使う（属性の変更履歴は別に全件から集める）。
+    """
+    scored = _scored(events, queries, MEMORY_HISTORY_SEARCH_KEYS)
+    scored.sort(reverse=True)
+    return [events[index] for _, index in scored]
+
+
 def search_memory_pending(items, queries, limit=MAX_RESULTS):
     """検索語のどれかにヒットした保留を、スコアの高い順に limit 件まで返す。
 
@@ -164,24 +181,3 @@ def search_memory_pending(items, queries, limit=MAX_RESULTS):
     検索対象は subject / target_key / target_value / proposed_key / proposed_value / evidence。
     """
     return _search_by_score(items, queries, PENDING_SEARCH_KEYS, limit)
-
-
-def related_memory_pending(items, state_items, found=(), limit=MAX_RESULTS):
-    """回答に渡す保留を、保存順で limit 件まで返す。
-
-    state_items は検索でヒットした現在値で、その subject + key に target_key か proposed_key で
-    つながる保留を優先して選び、残りを found（検索語でヒットした保留）から選ぶ。
-    つながる保留が limit を超える場合は、新しく保存されたものを残す。
-    """
-    addresses = {(i["subject"], i["key"]) for i in state_items}
-    linked = [
-        p
-        for p in reversed(items)
-        if (p["subject"], p.get("target_key")) in addresses
-        or (p["subject"], p.get("proposed_key")) in addresses
-    ]
-    chosen = []
-    for pending in linked + list(found):
-        if pending not in chosen and len(chosen) < limit:
-            chosen.append(pending)
-    return [p for p in items if p in chosen]

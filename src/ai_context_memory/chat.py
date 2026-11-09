@@ -63,13 +63,15 @@ from .revert import (
     revert_prompt,
 )
 from .search import (
+    MAX_ATTRIBUTE_HISTORY_EVENTS,
+    MAX_ATTRIBUTES,
+    MAX_HISTORY_ATTRIBUTES,
     MAX_ROUNDS,
     SearchPlanError,
     normalize,
     parse_plan,
-    related_memory_pending,
+    rank_memory_history,
     search_memories,
-    search_memory_history,
     search_memory_pending,
     search_memory_state,
     search_working_memory_history,
@@ -83,11 +85,15 @@ from .structured_memory import (
     StructuredMemoryError,
     add_pending,
     append_memory_history,
+    attribute_history,
+    attribute_of,
     load_memory_history,
     load_memory_pending,
     load_memory_state,
     find_item,
     parse_extraction,
+    pending_attributes,
+    related_memory_pending,
     related_memory_state,
     save_memory_pending,
     save_memory_state,
@@ -113,8 +119,11 @@ class Retrieval:
     memories: list = field(default_factory=list)  # ヒットした従来の長期記憶
     memory_state: list = field(default_factory=list)  # ヒットした構造化した長期記憶の現在値
     search_log: list = field(default_factory=list)  # 長期記憶の検索ログ。件数は上の2つの合計
-    memory_history_events: list = field(default_factory=list)  # ヒットした長期記憶の変更履歴（古い順）
-    memory_history_log: list = field(default_factory=list)  # 検索しなかったターンは空
+    memory_history_events: list = field(default_factory=list)  # 属性ごとの長期記憶の変更履歴（属性の順、属性内は古い順）
+    memory_history_log: list = field(default_factory=list)  # 検索しなかったターンは空。件数はヒットしたイベント数
+    # 変更履歴を渡した属性と、それぞれ全件を渡したか。変更履歴を検索しなかったターンは None
+    # {"attributes": [{"subject", "key", "shown", "total"}, ...], "omitted_attributes": 変更履歴を渡さなかった属性の数}
+    memory_history_scope: dict = None
     memory_pending: list = field(default_factory=list)  # 回答に渡す構造化した長期記憶の保留（保存順）
     memory_pending_log: list = field(default_factory=list)  # 保留を検索しなかったターンは空
     history_events: list = field(default_factory=list)  # ヒットした作業記憶の変更履歴（古い順）
@@ -1032,7 +1041,9 @@ class ChatSession:
         発話の意味はここでは解釈しない。
         長期記憶は、従来の記憶と構造化した現在値・保留を同じ検索語で検索し、
         どれも0件なら1回だけ検索語を変えて再検索する。変更履歴の検索はそれぞれ1回だけ。
-        保留は、検索語でヒットしたものに加えて、ヒットした現在値の key につながるものも取得する。
+        構造化した長期記憶の検索は、関係する属性（subject と番号の無い key）を見つけるためのもので、
+        現在値・保留・長期記憶の変更履歴のどれかでヒットした属性について、その属性の現在値と未解決の保留を集め、
+        長期記憶の変更履歴の検索が必要なターンでは、その属性の変更履歴を検索語によらず古い順に集める（_expand_history）。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
         """
         result = Retrieval()
@@ -1043,9 +1054,12 @@ class ChatSession:
             except WorkingMemoryError as e:
                 result.warnings.append(str(e))
         memory_events = []
+        # 読めなかった変更履歴を「記録が無い」として扱わないよう、読めたかどうかを区別する
+        memory_events_loaded = False
         if self.memory_history_path:
             try:
                 memory_events = load_memory_history(self.memory_history_path)
+                memory_events_loaded = True
             except StructuredMemoryError as e:
                 result.warnings.append(str(e))
         # 解決済みの保留は回答AIへ渡さない（解決の結果は現在値と変更履歴にある）
@@ -1055,6 +1069,9 @@ class ChatSession:
             # 検索できるものが無い
             return result
         tried = []
+        found_pending = []
+        history_hits = None  # 長期記憶の変更履歴を検索したターンだけ、ヒットしたイベント（順位順）
+        history_queries = []
         for round_number in range(MAX_ROUNDS):
             try:
                 plan = parse_plan(self.llm.plan_search(user_text, tried, self.working_memory))
@@ -1066,11 +1083,9 @@ class ChatSession:
                 result.history_events.extend(found)
                 result.history_log.append((plan.history_queries, len(found)))
             if round_number == 0 and plan.memory_history_queries:
-                found = self._with_confirmation_texts(
-                    search_memory_history(memory_events, plan.memory_history_queries)
-                )
-                result.memory_history_events.extend(found)
-                result.memory_history_log.append((plan.memory_history_queries, len(found)))
+                history_queries = plan.memory_history_queries
+                history_hits = rank_memory_history(memory_events, history_queries)
+                result.memory_history_log.append((history_queries, len(history_hits)))
             used = {normalize(q) for q in tried}
             queries = [q for q in plan.queries if normalize(q) not in used]
             if not queries or not has_long_term:
@@ -1085,15 +1100,61 @@ class ChatSession:
                 result.memory_state.extend(found_state)
                 break
             tried += queries
-        if result.memory_state:
-            # 同じ属性に値が複数あるとき（home_location と home_location_2）、どれか1つだけで断定しないよう全部渡す
-            result.memory_state = related_memory_state(self.memory_state, result.memory_state)
-        if result.search_log and pending_items:
-            # 回答AIが古い現在値だけで断定しないよう、関係する保留を一緒に渡す
-            result.memory_pending = related_memory_pending(pending_items, result.memory_state, found_pending)
+        # ヒットした属性。現在値、保留、変更履歴の順に、それぞれのヒットの順位順で並べる
+        direct = [attribute_of(item["subject"], item["key"]) for item in result.memory_state] + [
+            attribute for pending in found_pending for attribute in pending_attributes(pending)
+        ]
+        attributes = list(
+            dict.fromkeys(
+                direct
+                + [
+                    attribute_of(event["subject"], event["key"])
+                    for event in history_hits or ()
+                    if isinstance(event.get("subject"), str) and isinstance(event.get("key"), str)
+                ]
+            )
+        )
+        with_history = []
+        if history_hits is not None and memory_events_loaded:
+            with_history = self._expand_history(result, memory_events, attributes)
+        # 現在値・保留でヒットした属性と、変更履歴を渡す属性。変更履歴だけでヒットし、変更履歴を渡さない属性は含めない
+        # （「記憶はどう変わった？」のように属性を特定しない検索語で、無関係な属性の現在値まで渡さないため）
+        selected = [a for a in attributes[:MAX_ATTRIBUTES] if a in direct or a in with_history]
+        # 同じ属性に値が複数あるとき（home_location と home_location_2）、どれか1つだけで断定しないよう全部渡す。
+        # 保留や変更履歴だけでヒットした属性も、その属性の現在値を渡す
+        result.memory_state = related_memory_state(self.memory_state, result.memory_state, selected)
+        if pending_items and (result.search_log or selected):
+            # 回答AIが古い現在値だけで断定しないよう、ヒットした属性につながる保留を一緒に渡す
+            result.memory_pending = related_memory_pending(pending_items, selected, found_pending)
             keys = list(dict.fromkeys(item["key"] for item in result.memory_state))
-            result.memory_pending_log.append((keys + result.search_log[-1][0], len(result.memory_pending)))
+            terms = result.search_log[-1][0] if result.search_log else history_queries
+            result.memory_pending_log.append((keys + terms, len(result.memory_pending)))
         return result
+
+    def _expand_history(self, result, memory_events, attributes):
+        """先頭から MAX_ATTRIBUTES 個の属性のうち、変更履歴のあるものを先頭から MAX_HISTORY_ATTRIBUTES 個選び、
+        その変更履歴を結果へ入れて、選んだ属性のリストを返す。
+
+        変更履歴は検索語によらず、その属性のイベント（番号付きの key のものも含む）を古い順に集め、
+        MAX_ATTRIBUTE_HISTORY_EVENTS を超える分は古いほうを省く。全件を渡したかどうかと、
+        変更履歴があるのに渡さなかった属性の数を memory_history_scope に残し、回答AIへ伝える。
+        """
+        scope = {"attributes": [], "omitted_attributes": 0}
+        chosen = []
+        for index, attribute in enumerate(attributes):
+            shown, total = attribute_history(memory_events, attribute, MAX_ATTRIBUTE_HISTORY_EVENTS)
+            if not total:
+                continue
+            if index >= MAX_ATTRIBUTES or len(chosen) >= MAX_HISTORY_ATTRIBUTES:
+                scope["omitted_attributes"] += 1
+                continue
+            chosen.append(attribute)
+            subject, key = attribute
+            scope["attributes"].append({"subject": subject, "key": key, "shown": len(shown), "total": total})
+            result.memory_history_events.extend(self._with_confirmation_texts(shown))
+        if scope["attributes"] or scope["omitted_attributes"]:
+            result.memory_history_scope = scope
+        return chosen
 
     def recall(self, user_text):
         """retrieve のうち従来の長期記憶の分だけを、(ヒットした記憶, 検索ログ, 警告メッセージ) で返す。"""
@@ -1109,11 +1170,12 @@ class ChatSession:
         memory_history_events=(),
         memory_pending=(),
         recorded=False,
+        memory_history_scope=None,
     ):
         """ユーザー発話を履歴に追加し、LLMへ渡して応答を返す。
 
         渡すのは作業記憶（常に全項目）、retrieve の結果（memories / history_events /
-        memory_state / memory_history_events / memory_pending）、現在の会話だけ。
+        memory_state / memory_history_events / memory_pending / memory_history_scope）、現在の会話だけ。
         recorded が真なら、その発話は確認の回答として会話と会話原文に追加済みなので、応答だけを追加する。
         """
         if not recorded:
@@ -1127,6 +1189,7 @@ class ChatSession:
                 memory_state,
                 memory_history_events,
                 memory_pending,
+                memory_history_scope,
             )
         except Exception:
             # 失敗した発話を残すとuserが連続するため、履歴を元に戻す（会話原文に保存済みの発話は残す）

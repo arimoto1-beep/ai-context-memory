@@ -18,7 +18,7 @@ from ai_context_memory.llm import (
     format_working_memory_request,
 )
 from ai_context_memory.memory import append_memories
-from ai_context_memory.search import MAX_RESULTS, related_memory_pending, search_memory_pending
+from ai_context_memory.search import MAX_RESULTS, search_memory_pending
 from ai_context_memory.structured_memory import (
     ENDING_EXPRESSIONS,
     StructuredMemoryError,
@@ -28,6 +28,7 @@ from ai_context_memory.structured_memory import (
     load_memory_pending,
     load_memory_state,
     parse_extraction,
+    related_memory_pending,
     save_memory_pending,
     save_memory_state,
 )
@@ -1016,7 +1017,7 @@ def test_related_pending_prefers_linked_items_and_is_capped():
     linked = [{**NAGOYA_PENDING, "id": f"p{n:03d}", "evidence": f"発言{n}"} for n in range(1, 8)]
     other = {**NAGOYA_PENDING, "id": "p100", "target_key": "favorite_fruit", "evidence": "別"}
 
-    chosen = related_memory_pending([other] + linked, STATE, found=[other])
+    chosen = related_memory_pending([other] + linked, [("user", "home_location")], found=[other])
 
     assert len(chosen) == MAX_RESULTS
     assert other not in chosen
