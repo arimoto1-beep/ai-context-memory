@@ -143,6 +143,39 @@ def pending_attributes(pending):
     )
 
 
+def attribute_catalog(items, pending):
+    """現在値と保留（呼び出し側が未解決のものだけを渡す）から、属性 (subject, 番号の無い key) の一覧を返す。
+
+    検索プランナーへ渡すためのもので、値や発言は含めない。重複を除き、subject・key の順に並べる（決定的な順序）。
+    """
+    attributes = {attribute_of(item["subject"], item["key"]) for item in items}
+    for item in pending:
+        attributes.update(pending_attributes(item))
+    return sorted(attributes)
+
+
+ATTRIBUTE_NOT_IN_LIST = "not_in_list"  # 一覧に無い属性
+ATTRIBUTE_AMBIGUOUS = "ambiguous"  # subject の無い key が、複数の subject の属性に当てはまる
+
+
+def resolve_attribute(identifier, catalog):
+    """検索プランナーが選んだ属性の識別子を、一覧 catalog の属性に完全一致で照らし合わせる。
+
+    「subject.key」はその subject と key の組だけに、subject の無い「key」は、その key を持つ属性が
+    一覧にちょうど1つあるときだけに当てはめる。部分一致・番号付きの key の読み替え・新しい属性の作成はしない。
+    戻り値は (属性, None) か、当てはまらなければ (None, 理由)。
+    """
+    text = identifier.strip()
+    if "." in text:
+        subject, key = text.split(".", 1)
+        attribute = (subject, key)
+        return (attribute, None) if attribute in catalog else (None, ATTRIBUTE_NOT_IN_LIST)
+    matches = [attribute for attribute in catalog if attribute[1] == text]
+    if len(matches) == 1:
+        return matches[0], None
+    return None, ATTRIBUTE_AMBIGUOUS if matches else ATTRIBUTE_NOT_IN_LIST
+
+
 def related_memory_state(items, found, attributes=()):
     """検索でヒットした現在値に、同じ属性の項目（番号付きの key など）と、attributes の属性の項目を足して返す。
 

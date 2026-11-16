@@ -39,7 +39,7 @@ from .confirmation import (
     snapshot,
 )
 from .history import HistoryError, append_history, load_history
-from .llm import LLMError
+from .llm import LLMError, format_attribute_list
 from .memory import (
     ORIGIN_USER,
     MemoryStoreError,
@@ -63,11 +63,18 @@ from .revert import (
     revert_prompt,
 )
 from .search import (
+    HISTORY_SEARCH_KEYS,
     MAX_ATTRIBUTE_HISTORY_EVENTS,
     MAX_ATTRIBUTES,
+    MAX_CATALOG_ATTRIBUTES,
     MAX_HISTORY_ATTRIBUTES,
     MAX_ROUNDS,
+    MEMORY_HISTORY_SEARCH_KEYS,
+    MEMORY_SEARCH_KEYS,
+    PENDING_SEARCH_KEYS,
+    STATE_SEARCH_KEYS,
     SearchPlanError,
+    matching_records,
     normalize,
     parse_plan,
     rank_memory_history,
@@ -85,6 +92,7 @@ from .structured_memory import (
     StructuredMemoryError,
     add_pending,
     append_memory_history,
+    attribute_catalog,
     attribute_history,
     attribute_of,
     load_memory_history,
@@ -95,6 +103,7 @@ from .structured_memory import (
     pending_attributes,
     related_memory_pending,
     related_memory_state,
+    resolve_attribute,
     save_memory_pending,
     save_memory_state,
     timestamp_now,
@@ -127,8 +136,16 @@ class Retrieval:
     memory_pending: list = field(default_factory=list)  # 回答に渡す構造化した長期記憶の保留（保存順）
     memory_pending_log: list = field(default_factory=list)  # 保留を検索しなかったターンは空
     history_events: list = field(default_factory=list)  # ヒットした作業記憶の変更履歴（古い順）
-    history_log: list = field(default_factory=list)  # 検索しなかったターンは空
+    history_log: list = field(default_factory=list)  # 検索しなかったターンは空。読み込めなかったときの件数は None
     warnings: list = field(default_factory=list)
+    # 検索プランナーへ渡した属性一覧。{"attributes", "total", "provided", "limit", "chars"}
+    # provided が偽なら、上限を超えたため一覧を渡さず、検索語だけで属性を探した（chars はそのとき渡したブロックの文字数）
+    attribute_list: dict = None
+    selected_attributes: list = field(default_factory=list)  # 属性一覧から選ばれ、一覧と完全一致した属性
+    rejected_attributes: list = field(default_factory=list)  # 一覧と一致しなかった選択の (識別子, 理由)
+    ignored_attributes: list = field(default_factory=list)  # 使わなかった選択（不要という判断と一緒に返された、上限超えなど）
+    auto_history_attributes: list = field(default_factory=list)  # R4 で、プランナーの判断によらず変更履歴を渡した属性
+    status: dict = None  # 回答AIへ渡す検索の状態（llm.format_retrieval_status）。検索を始めていなければ None
 
 
 # 保留の確認の1ステップの結果（ConfirmationResult.status）
@@ -1045,16 +1062,26 @@ class ChatSession:
         現在値・保留・長期記憶の変更履歴のどれかでヒットした属性について、その属性の現在値と未解決の保留を集め、
         長期記憶の変更履歴の検索が必要なターンでは、その属性の変更履歴を検索語によらず古い順に集める（_expand_history）。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
+
+        MVP14:
+        - 現在値と未解決の保留から属性一覧（識別子だけ）を作り、MAX_CATALOG_ATTRIBUTES 以下なら検索プランナーへ渡す。
+          プランナーが attributes で選んだ識別子は一覧と完全一致で照らし合わせ（resolve_attribute）、
+          一致したものだけを、検索でヒットした属性より前に、属性単位で集める起点にする。
+        - R4: 長期記憶の検索語のうち、現在値には一致せず、保留か変更履歴に一致した語がある属性は、
+          プランナーが変更履歴を不要と判断していても、その属性の変更履歴を渡す（_non_current_attributes）。
+        - 範囲ごとの検索の状態を status にまとめる（_retrieval_status）。
         """
         result = Retrieval()
         events = []
+        # 読めなかった変更履歴を「記録が無い」として扱わないよう、読めたかどうかを区別する
+        events_loaded = False
         if self.working_memory_history_path:
             try:
                 events = load_working_memory_history(self.working_memory_history_path)
+                events_loaded = True
             except WorkingMemoryError as e:
                 result.warnings.append(str(e))
         memory_events = []
-        # 読めなかった変更履歴を「記録が無い」として扱わないよう、読めたかどうかを区別する
         memory_events_loaded = False
         if self.memory_history_path:
             try:
@@ -1064,28 +1091,74 @@ class ChatSession:
                 result.warnings.append(str(e))
         # 解決済みの保留は回答AIへ渡さない（解決の結果は現在値と変更履歴にある）
         pending_items = self.unresolved_pending()
+        catalog = attribute_catalog(self.memory_state, pending_items)
+        provided = len(catalog) <= MAX_CATALOG_ATTRIBUTES
+        result.attribute_list = {
+            "attributes": catalog if provided else [],
+            "total": len(catalog),
+            "provided": provided,
+            "limit": MAX_CATALOG_ATTRIBUTES,
+        }
+        result.attribute_list["chars"] = len(format_attribute_list(result.attribute_list))
+        facts = {
+            "events_loaded": events_loaded,
+            "events": events,
+            "memory_events_loaded": memory_events_loaded,
+            "memory_events": memory_events,
+            "pending_items": pending_items,
+        }
         has_long_term = bool(self.memories or self.memory_state or pending_items)
         if not has_long_term and not events and not memory_events:
-            # 検索できるものが無い
+            # 検索できるものが無い（読めなかったものは unavailable として伝える）
+            result.status = self._retrieval_status(result, "skipped", facts)
             return result
         tried = []
         found_pending = []
         history_hits = None  # 長期記憶の変更履歴を検索したターンだけ、ヒットしたイベント（順位順）
         history_queries = []
+        chosen = []  # 属性一覧から選ばれ、一覧と完全一致した属性（選ばれた順）
+        auto = []  # R4: 現在値には一致せず、保留か変更履歴に一致した検索語がある属性
+        evidence = set()  # 検索語が現在値か保留に一致した属性（件数の上限を付けずに調べる）
+        search = "not_needed"
         for round_number in range(MAX_ROUNDS):
             try:
-                plan = parse_plan(self.llm.plan_search(user_text, tried, self.working_memory))
+                plan = parse_plan(
+                    self.llm.plan_search(user_text, tried, self.working_memory, result.attribute_list)
+                )
             except (LLMError, SearchPlanError) as e:
                 result.warnings.append(f"記憶を検索できませんでした: {e}")
+                search = "failed" if round_number == 0 else "retry_failed"
                 break
+            result.ignored_attributes += plan.ignored_attributes
+            # 一覧を渡さなかったとき（上限超え）も、実際の一覧との完全一致だけを認める
+            for identifier in plan.attributes:
+                attribute, reason = resolve_attribute(identifier, catalog)
+                if attribute is None:
+                    result.rejected_attributes.append((identifier, reason))
+                elif attribute in chosen:
+                    continue
+                elif len(chosen) < MAX_ATTRIBUTES:
+                    chosen.append(attribute)
+                else:
+                    result.ignored_attributes.append(identifier)
+            if round_number == 0 and (
+                plan.queries or plan.attributes or plan.history_queries or plan.memory_history_queries
+            ):
+                search = "done"
             if round_number == 0 and plan.history_queries:
                 found = search_working_memory_history(events, plan.history_queries)
                 result.history_events.extend(found)
-                result.history_log.append((plan.history_queries, len(found)))
+                # 読めなかった変更履歴は「0件」ではない
+                result.history_log.append((plan.history_queries, len(found) if events_loaded else None))
+                facts["working_memory_history_total"] = len(
+                    matching_records(events, plan.history_queries, HISTORY_SEARCH_KEYS)
+                )
             if round_number == 0 and plan.memory_history_queries:
                 history_queries = plan.memory_history_queries
                 history_hits = rank_memory_history(memory_events, history_queries)
-                result.memory_history_log.append((history_queries, len(history_hits)))
+                result.memory_history_log.append(
+                    (history_queries, len(history_hits) if memory_events_loaded else None)
+                )
             used = {normalize(q) for q in tried}
             queries = [q for q in plan.queries if normalize(q) not in used]
             if not queries or not has_long_term:
@@ -1094,19 +1167,33 @@ class ChatSession:
             found = search_memories(self.memories, queries)
             found_state = search_memory_state(self.memory_state, queries)
             found_pending = search_memory_pending(pending_items, queries)
+            auto = self._non_current_attributes(queries, pending_items, memory_events)
+            evidence = {
+                attribute_of(item["subject"], item["key"])
+                for item in matching_records(self.memory_state, queries, STATE_SEARCH_KEYS)
+            } | {
+                attribute
+                for pending in matching_records(pending_items, queries, PENDING_SEARCH_KEYS)
+                for attribute in pending_attributes(pending)
+            }
             result.search_log.append((queries, len(found) + len(found_state)))
-            if found or found_state or found_pending:
+            facts["memories_total"] = len(matching_records(self.memories, queries, MEMORY_SEARCH_KEYS))
+            # 属性を選んだ、または変更履歴だけに一致した（R4）ときも、検索語を変えて探し直す必要はない
+            if found or found_state or found_pending or chosen or auto:
                 result.memories.extend(found)
                 result.memory_state.extend(found_state)
                 break
             tried += queries
-        # ヒットした属性。現在値、保留、変更履歴の順に、それぞれのヒットの順位順で並べる
-        direct = [attribute_of(item["subject"], item["key"]) for item in result.memory_state] + [
-            attribute for pending in found_pending for attribute in pending_attributes(pending)
-        ]
-        attributes = list(
+        result.selected_attributes = list(chosen)
+        hits = (
+            [attribute_of(item["subject"], item["key"]) for item in result.memory_state]
+            + [attribute for pending in found_pending for attribute in pending_attributes(pending)]
+        )
+        # 検索語との一致の順位（現在値、保留、R4、変更履歴の順に、それぞれのヒットの順位順）
+        ranked = list(
             dict.fromkeys(
-                direct
+                hits
+                + auto
                 + [
                     attribute_of(event["subject"], event["key"])
                     for event in history_hits or ()
@@ -1114,34 +1201,159 @@ class ChatSession:
                 ]
             )
         )
+        # 属性の上限（MAX_ATTRIBUTES）と変更履歴の上限（MAX_HISTORY_ATTRIBUTES）で落とす順を決める並び。
+        # 選ばれ、検索語にも一致した属性（一致の順位順）→ 検索語で現在値・保留に一致した属性 → R4 の属性 →
+        # 選ばれただけの属性（選ばれた順）→ 変更履歴だけに一致した属性。
+        # プランナーは一覧の順に、関係の薄い属性まで選ぶことがあるため、選んだだけの属性は検索語に一致した属性の後に置く
+        # （上限を超える数が選ばれても、検索語に一致した属性の現在値と変更履歴を落とさない）
+        # 「検索語にも一致した」は件数の上限の前で判定する（上限で検索結果から外れた現在値でも、一致は一致）
+        matched = [a for a in ranked if a in chosen] + [a for a in chosen if a not in ranked and a in evidence]
+        unmatched = [a for a in chosen if a not in matched]
+        direct = matched + hits + unmatched
+        attributes = list(dict.fromkeys(matched + hits + auto + unmatched + ranked))
         with_history = []
-        if history_hits is not None and memory_events_loaded:
-            with_history = self._expand_history(result, memory_events, attributes)
+        if (history_hits is not None or auto) and memory_events_loaded:
+            # プランナーが変更履歴を必要と判断したら、MVP13 と同じくすべての属性が対象。
+            # 不要と判断していても、R4 の属性だけは対象にする（件数の上限と省略の表し方は MVP13 と同じ）
+            eligible = None if history_hits is not None else set(auto)
+            with_history = self._expand_history(result, memory_events, attributes, eligible)
+            if history_hits is None:
+                result.auto_history_attributes = list(with_history)
         # 現在値・保留でヒットした属性と、変更履歴を渡す属性。変更履歴だけでヒットし、変更履歴を渡さない属性は含めない
         # （「記憶はどう変わった？」のように属性を特定しない検索語で、無関係な属性の現在値まで渡さないため）
         selected = [a for a in attributes[:MAX_ATTRIBUTES] if a in direct or a in with_history]
         # 同じ属性に値が複数あるとき（home_location と home_location_2）、どれか1つだけで断定しないよう全部渡す。
         # 保留や変更履歴だけでヒットした属性も、その属性の現在値を渡す
         result.memory_state = related_memory_state(self.memory_state, result.memory_state, selected)
+        # 状態として伝える「特定できた属性」は、実際に現在値か保留・変更履歴を渡す属性
+        # （検索語で直接ヒットした現在値は、属性の上限を超えても渡る: related_memory_state）。
+        # 省いた属性は、一致したのに現在値を1つも渡せなかった属性だけを数える
+        passed = [attribute_of(item["subject"], item["key"]) for item in result.memory_state]
+        facts["identified"] = list(dict.fromkeys(selected + passed))
+        stored = {attribute_of(item["subject"], item["key"]) for item in self.memory_state}
+        facts["omitted_state_attributes"] = len(
+            [a for a in dict.fromkeys(direct) if a in stored and a not in facts["identified"]]
+        )
         if pending_items and (result.search_log or selected):
             # 回答AIが古い現在値だけで断定しないよう、ヒットした属性につながる保留を一緒に渡す
             result.memory_pending = related_memory_pending(pending_items, selected, found_pending)
             keys = list(dict.fromkeys(item["key"] for item in result.memory_state))
             terms = result.search_log[-1][0] if result.search_log else history_queries
             result.memory_pending_log.append((keys + terms, len(result.memory_pending)))
+            linked = {p["id"] for p in pending_items if set(selected).intersection(pending_attributes(p))}
+            facts["pending_total"] = len(linked | {p["id"] for p in found_pending})
+        facts["long_term_searched"] = bool(
+            result.search_log or chosen or result.rejected_attributes or history_hits is not None
+        )
+        facts["history_attempted"] = history_hits is not None or bool(auto)
+        result.status = self._retrieval_status(result, search, facts)
         return result
 
-    def _expand_history(self, result, memory_events, attributes):
+    def _non_current_attributes(self, queries, pending_items, memory_events):
+        """R4。検索語ごとに、現在値には一致せず、未解決の保留か変更履歴に一致した属性を、重複なく返す。
+
+        検索語ごとに判定するので、属性一覧からの選択や、別の検索語で現在値にも一致したことでは無効にならない
+        （例: 「名古屋」が保留だけに一致すれば、同じ属性の現在値が別の語で見つかっていても対象）。
+        件数の上限で現在値の一致を取りこぼさないよう、上限を付けずに一致を調べる。
+        """
+        found = []
+        for query in queries:
+            in_state = {
+                attribute_of(item["subject"], item["key"])
+                for item in matching_records(self.memory_state, [query], STATE_SEARCH_KEYS)
+            }
+            elsewhere = [
+                attribute
+                for pending in matching_records(pending_items, [query], PENDING_SEARCH_KEYS)
+                for attribute in pending_attributes(pending)
+            ] + [
+                attribute_of(event["subject"], event["key"])
+                for event in matching_records(memory_events, [query], MEMORY_HISTORY_SEARCH_KEYS)
+                if isinstance(event.get("subject"), str) and isinstance(event.get("key"), str)
+            ]
+            found += [attribute for attribute in elsewhere if attribute not in in_state]
+        return list(dict.fromkeys(found))
+
+    def _retrieval_status(self, result, search, facts):
+        """範囲（現在値・保留・変更履歴・従来の記憶・作業記憶の変更履歴）ごとの検索の状態をまとめる。
+
+        状態は found / no_match / not_searched / unavailable / none_stored（変更履歴は not_included も）。
+        none_stored は、読み込めた（または起動時に読み込み済みの）範囲が本当に空のときだけ使う。
+        読み込めなかった範囲は、検索したかどうかによらず unavailable。
+        保存先が設定されていない範囲は含めない。値・ファイルパス・例外のメッセージは含めない。
+        """
+        searched = search in ("done", "retry_failed")
+        failed = search == "failed"
+
+        def scope_status(stored, loaded, attempted, count, **omitted):
+            if not loaded:
+                return {"result": "unavailable"}
+            if not stored:
+                return {"result": "none_stored"}
+            if failed:
+                return {"result": "unavailable"}
+            if not (searched and attempted):
+                return {"result": "not_searched"}
+            if count:
+                return {"result": "found", "count": count, **{k: v for k, v in omitted.items() if v > 0}}
+            return {"result": "no_match"}
+
+        long_term = facts.get("long_term_searched", False)
+        scopes = []
+        if self.memory_state_path:
+            scopes.append(("state", scope_status(
+                self.memory_state, True, long_term, len(result.memory_state),
+                omitted_attributes=facts.get("omitted_state_attributes", 0),
+            )))
+        if self.memory_pending_path:
+            scopes.append(("pending", scope_status(
+                facts["pending_items"], True, long_term, len(result.memory_pending),
+                omitted=facts.get("pending_total", 0) - len(result.memory_pending),
+            )))
+        if self.memory_history_path:
+            history = result.memory_history_scope or {"attributes": [], "omitted_attributes": 0}
+            status = scope_status(
+                facts["memory_events"], facts["memory_events_loaded"], facts.get("history_attempted", False),
+                len(history["attributes"]), omitted_attributes=history["omitted_attributes"],
+            )
+            if status["result"] == "no_match" and history["omitted_attributes"]:
+                status = {"result": "not_included", "omitted_attributes": history["omitted_attributes"]}
+            scopes.append(("history", status))
+        if self.memory_path:
+            scopes.append(("memories", scope_status(
+                self.memories, True, bool(result.search_log), len(result.memories),
+                omitted=facts.get("memories_total", 0) - len(result.memories),
+            )))
+        if self.working_memory_history_path:
+            scopes.append(("working_memory_history", scope_status(
+                facts["events"], facts["events_loaded"], bool(result.history_log), len(result.history_events),
+                omitted=facts.get("working_memory_history_total", 0) - len(result.history_events),
+            )))
+        status = {"search": search, "scopes": scopes}
+        attribute_list = result.attribute_list
+        if self.memory_state_path and attribute_list and attribute_list["total"]:
+            status["attribute_list"] = {
+                "result": "provided" if attribute_list["provided"] else "not_provided",
+                "count": attribute_list["total"],
+            }
+        if self.memory_state_path and searched and long_term:
+            status["attributes"] = [f"{subject}.{key}" for subject, key in facts.get("identified", [])]
+        return status
+
+    def _expand_history(self, result, memory_events, attributes, eligible=None):
         """先頭から MAX_ATTRIBUTES 個の属性のうち、変更履歴のあるものを先頭から MAX_HISTORY_ATTRIBUTES 個選び、
         その変更履歴を結果へ入れて、選んだ属性のリストを返す。
 
         変更履歴は検索語によらず、その属性のイベント（番号付きの key のものも含む）を古い順に集め、
         MAX_ATTRIBUTE_HISTORY_EVENTS を超える分は古いほうを省く。全件を渡したかどうかと、
         変更履歴があるのに渡さなかった属性の数を memory_history_scope に残し、回答AIへ伝える。
+        eligible を渡すと、その属性だけを対象にする（ほかの属性は、渡さなかった属性としても数えない）。
         """
         scope = {"attributes": [], "omitted_attributes": 0}
         chosen = []
         for index, attribute in enumerate(attributes):
+            if eligible is not None and attribute not in eligible:
+                continue
             shown, total = attribute_history(memory_events, attribute, MAX_ATTRIBUTE_HISTORY_EVENTS)
             if not total:
                 continue
@@ -1171,11 +1383,12 @@ class ChatSession:
         memory_pending=(),
         recorded=False,
         memory_history_scope=None,
+        retrieval_status=None,
     ):
         """ユーザー発話を履歴に追加し、LLMへ渡して応答を返す。
 
         渡すのは作業記憶（常に全項目）、retrieve の結果（memories / history_events /
-        memory_state / memory_history_events / memory_pending / memory_history_scope）、現在の会話だけ。
+        memory_state / memory_history_events / memory_pending / memory_history_scope / status）、現在の会話だけ。
         recorded が真なら、その発話は確認の回答として会話と会話原文に追加済みなので、応答だけを追加する。
         """
         if not recorded:
@@ -1190,6 +1403,7 @@ class ChatSession:
                 memory_history_events,
                 memory_pending,
                 memory_history_scope,
+                retrieval_status,
             )
         except Exception:
             # 失敗した発話を残すとuserが連続するため、履歴を元に戻す（会話原文に保存済みの発話は残す）

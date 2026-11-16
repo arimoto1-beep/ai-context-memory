@@ -49,7 +49,7 @@ class FakeLLM:
         self.prompts.append(format_prompt(messages, memories, working_memory))
         return self.replies.pop(0)
 
-    def plan_search(self, user_text, previous_queries=(), working_memory=None):
+    def plan_search(self, user_text, previous_queries=(), working_memory=None, attribute_list=None):
         self.plan_calls.append((user_text, list(previous_queries)))
         result = self.plans.pop(0)
         if isinstance(result, Exception):

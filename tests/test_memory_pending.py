@@ -171,8 +171,8 @@ class FakeLLM:
         self.prompts.append(format_prompt(messages, *context))
         return self.replies.pop(0)
 
-    def plan_search(self, user_text, previous_queries=(), working_memory=None):
-        self.plan_inputs.append(format_search_request(user_text, previous_queries, working_memory))
+    def plan_search(self, user_text, previous_queries=(), working_memory=None, attribute_list=None):
+        self.plan_inputs.append(format_search_request(user_text, previous_queries, working_memory, attribute_list))
         return self.plans.pop(0) if self.plans else NOTHING_NEEDED
 
     def extract_memories(self, user_text):
@@ -941,7 +941,10 @@ def test_unrelated_question_gets_no_pending(with_pending):
 
     outputs = run_cli(ChatSession(llm, *with_pending), ["1+1は？", "exit"])
 
-    assert llm.prompts == ["[user]\n1+1は？"]
+    # 記憶のブロックは無く、検索しなかったという状態だけが付く（MVP14）
+    assert llm.prompts[0].endswith("[/retrieval status]\n\n[user]\n1+1は？")
+    assert "[long-term memory pending]" not in llm.prompts[0]
+    assert "long-term memory pending: not_searched" in llm.prompts[0]
     assert not any("長期保留検索" in o for o in outputs)
 
 

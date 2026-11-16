@@ -172,6 +172,29 @@ SYSTEM_PROMPT = (
     "または必要なイベントが見当たらない場合は、推測で補わず、履歴からは確認できないと伝えてください。"
     "検索で見つからなかったことは、記憶や変更履歴が存在しないことを意味しません。"
     "必要な記憶が見つからないときは、記録が無いと断定せず、見つけられなかったと伝えてください。"
+    "会話の前に [retrieval status] から [/retrieval status] までのブロックが付くことがあります。"
+    "これは、このターンで記憶をどう検索したかの状態で、記憶の内容ではありません。"
+    "search は検索全体の状態です。done は検索を行った、not_needed は検索が不要と判断して行わなかった、"
+    "failed は検索できなかった、retry_failed は1回目の検索で見つからず、検索語を変えた再検索ができなかった、"
+    "skipped は検索できる記憶が保存されていないため検索しなかったことを表します。"
+    "attribute list は、検索に使った保存済みの属性（subject.key）の一覧の状態です。"
+    "not_provided は、属性が多すぎるため一覧を使わずに検索したことを表し、関係する記憶を見落としている可能性があります。"
+    "attributes identified は、検索で関係すると特定できた属性で、none は特定できなかったことを表します。"
+    "それ以外の行は、long-term memory state（保存済みの記憶の値）、long-term memory pending（確認待ちの保留）、"
+    "long-term memory history（長期記憶の変更履歴）、retrieved memories（従来の記憶）、"
+    "working memory history（作業記憶の変更履歴）の範囲ごとの状態で、範囲ごとに独立しています。"
+    "ある範囲が unavailable でも、ほかの範囲で渡した記憶はそのまま有効です。"
+    "found は、記録が見つかり、そのブロックで渡したことを表します（数は渡した件数）。"
+    "omitted や not included は、上限のため一部を渡していないことを表します。"
+    "渡していない分があるときは、渡した分だけで全部がそろっているように説明しないでください。"
+    "no_match は検索したが一致する記録が見つからなかったこと、not_searched はその範囲を検索しなかったことを表し、"
+    "どちらも記録が無いことを意味しません。"
+    "unavailable は、その範囲をこのターンでは読み込めなかった、または検索できなかったことを表します。"
+    "記録が無いとは述べず、推測で補わず、今回は確認できなかったと伝えてください。"
+    "none_stored は、その範囲に記録が1件も保存されていないことを確認できたことを表します。"
+    "none_stored の範囲についてだけは、このシステムには保存されていないと伝えて構いません。"
+    "状態は、質問に答えるのに関係するときだけ触れてください。"
+    "ファイルやエラーの詳細など、ブロックに無い原因を推測して述べないでください。"
 )
 
 SEARCH_PLAN_SYSTEM_PROMPT = (
@@ -198,7 +221,25 @@ SEARCH_PLAN_SYSTEM_PROMPT = (
     "この発言に答えるために過去の記憶が必要そうな場合は needs_memory を true にし、"
     "queries に検索語を最大3個入れてください。"
     "一般知識や計算だけで答えられる発言、挨拶、新しい情報を伝えているだけの発言、"
-    "[working memory] だけで答えられる発言では、needs_memory を false、queries を空配列にしてください。"
+    "[working memory] だけで答えられる発言では、needs_memory を false、queries と attributes を空配列にしてください。"
+    "入力に [stored attributes] から [/stored attributes] までのブロックがある場合、"
+    "それは、ユーザーの属性のうち、現在の値か確認待ちの保留が保存されているものの subject.key の一覧です。値は含みません。"
+    "番号付きの key（hobby_2 など）は、番号の無い key にまとめています。"
+    "発言に答えるために一覧のどれかの属性の記憶が必要なら、その subject.key を一覧から一字一句そのまま "
+    "attributes に入れてください（最大5個）。"
+    "一覧に無い属性を作ったり、名前の似た別の属性で代用したりしないでください。"
+    "attributes で選んだ属性は、検索語によらず、その属性の現在の値と確認待ちの保留が回答するAIへ渡されます"
+    "（長期記憶の変更履歴が必要と判断した場合は、その属性の変更履歴も渡されます）。"
+    "attributes に入れるのは、発言が尋ねている種類の情報そのものを表す属性だけです。"
+    "念のために選んだり、関係がありそうなだけの属性を選んだりしないでください。迷う属性は選ばないでください。"
+    "発言に出てくる値（地名、会社名など）がどの属性の値か分からないときは、属性を推測して選ばず、"
+    "その値を queries に入れてください。値に一致した記憶の属性は、自動的に集められます。"
+    "特定の種類の情報ではなく、記憶全体の変化などを尋ねる発言では、attributes は空配列にしてください。"
+    "関係する属性が一覧に無ければ、attributes は空配列にしてください。"
+    "queries の検索語は、値や発言に現れる言葉（地名、会社名など）を探すために、これまでどおり使ってください。"
+    "変更履歴だけに残っていて、一覧に無い属性もあります。そうした属性は検索語で探してください。"
+    "ブロックに一覧の代わりに not listed とある場合は、属性が多すぎるため一覧を渡していません。"
+    "その場合は attributes を空配列にし、key として使われていそうな英語の snake_case も検索語に入れてください。"
     "長期記憶の変更履歴には、ユーザー自身の属性の値が初めて記録されたとき・別の値に置き換えられたときの"
     "イベントが、日時つきで古い順に保存されています。"
     "1つのイベントは、operation（add / replace / revert のいずれか）、subject、key、"
@@ -237,9 +278,9 @@ SEARCH_PLAN_SYSTEM_PROMPT = (
     "そこに挙がっている検索語では長期記憶が1件も見つかりませんでした。"
     "queries には同じ検索語を使わず、別の言い換え、より短い語、関連する語を考えてください。"
     "出力はJSONオブジェクトだけにしてください。前置き、説明、コードブロックの記号は付けないでください。"
-    "キーは needs_memory（true または false）、queries（文字列の配列）、"
+    "キーは needs_memory（true または false）、queries（文字列の配列）、attributes（文字列の配列）、"
     "needs_long_term_memory_history（true または false）、memory_history_queries（文字列の配列）、"
-    "needs_working_memory_history（true または false）、history_queries（文字列の配列）の6つです。"
+    "needs_working_memory_history（true または false）、history_queries（文字列の配列）の7つです。"
 )
 
 EXTRACTION_SYSTEM_PROMPT = (
@@ -555,6 +596,67 @@ def format_memory_pending(items):
     return "[long-term memory pending]\n" + "\n\n".join(entries) + "\n[/long-term memory pending]"
 
 
+def format_attribute_list(attribute_list):
+    """検索プランナーへ渡す属性一覧のブロック。属性が1つも無ければ空文字を返す。
+
+    attribute_list は ChatSession.retrieve の Retrieval.attribute_list（attributes / total / provided）。
+    上限を超えて一覧を渡さないときは、属性の数だけを書く（値や key は書かない）。
+    """
+    if not attribute_list or not attribute_list["total"]:
+        return ""
+    if attribute_list["provided"]:
+        lines = "\n".join(f"- {subject}.{key}" for subject, key in attribute_list["attributes"])
+    else:
+        lines = f"(not listed: {attribute_list['total']} attributes, more than the limit of {attribute_list['limit']})"
+    return f"[stored attributes]\n{lines}\n[/stored attributes]"
+
+
+# [retrieval status] の範囲の名前。回答AIへ渡すブロックの名前とそろえる
+STATUS_SCOPE_LABELS = {
+    "state": "long-term memory state",
+    "pending": "long-term memory pending",
+    "history": "long-term memory history",
+    "memories": "retrieved memories",
+    "working_memory_history": "working memory history",
+}
+
+
+def _status_scope_line(scope, status):
+    result = status["result"]
+    if scope == "history" and result == "found":
+        text = f"found {status['count']} attributes"
+        if status.get("omitted_attributes"):
+            text += f" ({status['omitted_attributes']} more matching attributes not included)"
+    elif scope == "history" and result == "not_included":
+        text = f"not_included ({status['omitted_attributes']} matching attributes)"
+    elif result == "found":
+        text = f"found {status['count']}"
+        if status.get("omitted_attributes"):
+            text += f" ({status['omitted_attributes']} more matching attributes omitted)"
+        if status.get("omitted"):
+            text += f" ({status['omitted']} omitted)"
+    else:
+        text = result
+    return f"{STATUS_SCOPE_LABELS[scope]}: {text}"
+
+
+def format_retrieval_status(status):
+    """検索の状態（Retrieval.status）を回答AIへ渡すブロックにする。状態が無ければ空文字を返す。
+
+    渡すのは状態の名前・件数・属性の識別子だけで、値・ファイルパス・例外のメッセージは含めない。
+    """
+    if not status:
+        return ""
+    lines = [f"search: {status['search']}"]
+    attribute_list = status.get("attribute_list")
+    if attribute_list:
+        lines.append(f"attribute list: {attribute_list['result']} ({attribute_list['count']} attributes)")
+    if status.get("attributes") is not None:
+        lines.append(f"attributes identified: {', '.join(status['attributes']) or 'none'}")
+    lines += [_status_scope_line(scope, scope_status) for scope, scope_status in status["scopes"]]
+    return "[retrieval status]\n" + "\n".join(lines) + "\n[/retrieval status]"
+
+
 def format_prompt(
     messages,
     memories=(),
@@ -564,6 +666,7 @@ def format_prompt(
     memory_history_events=(),
     memory_pending=(),
     memory_history_scope=None,
+    retrieval_status=None,
 ):
     parts = [f"[{m['role']}]\n{m['content']}" for m in messages]
     if memories:
@@ -584,6 +687,10 @@ def format_prompt(
         parts.insert(0, block)
     # 検索で取得した変更履歴は、現在状態である作業記憶のすぐ後に置く
     block = format_working_memory_history(history_events)
+    if block:
+        parts.insert(0, block)
+    # 検索の状態は、検索で取得した記憶の前に置く（どの範囲を検索できたかを先に示す）
+    block = format_retrieval_status(retrieval_status)
     if block:
         parts.insert(0, block)
     # 作業記憶は検索結果の有無に関係なく、常に先頭に置く
@@ -619,8 +726,12 @@ def format_confirmation_request(pending, current, question, answer):
     )
 
 
-def format_search_request(user_text, previous_queries=(), working_memory=None):
+def format_search_request(user_text, previous_queries=(), working_memory=None, attribute_list=None):
     text = f"[question]\n{user_text}"
+    # 保存済みの属性を選べるよう、属性の識別子だけの一覧を見せる（値は見せない）
+    block = format_attribute_list(attribute_list)
+    if block:
+        text = f"{block}\n\n{text}"
     # 現在状態だけで答えられる発言かどうかを判断できるよう、作業記憶を見せる
     block = format_working_memory(working_memory)
     if block:
@@ -646,8 +757,10 @@ class ClaudeCLI:
         memory_history_events=(),
         memory_pending=(),
         memory_history_scope=None,
+        retrieval_status=None,
     ):
-        """現在の会話履歴と、作業記憶、検索で取得した記憶・現在値・保留・変更履歴を渡し、アシスタントの応答テキストを返す。"""
+        """現在の会話履歴と、作業記憶、検索で取得した記憶・現在値・保留・変更履歴、検索の状態を渡し、
+        アシスタントの応答テキストを返す。"""
         return self._run(
             SYSTEM_PROMPT,
             format_prompt(
@@ -659,18 +772,20 @@ class ClaudeCLI:
                 memory_history_events,
                 memory_pending,
                 memory_history_scope,
+                retrieval_status,
             ),
         )
 
-    def plan_search(self, user_text, previous_queries=(), working_memory=None):
+    def plan_search(self, user_text, previous_queries=(), working_memory=None, attribute_list=None):
         """ユーザー発言1つから記憶の検索プランを作らせ、出力テキストをそのまま返す。解析と検証は呼び出し側で行う。
 
         previous_queries は0件だった長期記憶の検索語で、渡すと別の検索語を考えさせる。
         working_memory は現在の作業記憶で、検索が必要かどうかの判断材料として渡す。
+        attribute_list は保存済みの属性の一覧（Retrieval.attribute_list）で、識別子だけを渡す。
         """
         return self._run(
             SEARCH_PLAN_SYSTEM_PROMPT,
-            format_search_request(user_text, previous_queries, working_memory),
+            format_search_request(user_text, previous_queries, working_memory, attribute_list),
         )
 
     def extract_memories(self, user_text):

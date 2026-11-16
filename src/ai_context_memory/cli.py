@@ -359,6 +359,77 @@ def describe_event(event, legacy=False):
     return ""
 
 
+def format_count(count):
+    """検索のヒット件数。変更履歴を読み込めなかったとき（None）は「0件」と表示しない。"""
+    return "読み込めませんでした（0件ではありません）" if count is None else f"{count}件"
+
+
+STATUS_LABELS = {
+    "state": "現在値",
+    "pending": "保留",
+    "history": "長期履歴",
+    "memories": "記憶",
+    "working_memory_history": "作業履歴",
+}
+
+
+def format_status_summary(status):
+    """回答AIへ渡す検索の状態を、CLI 用に1行にまとめる（回答AIへ渡すものと同じ状態名）。"""
+    parts = [f"検索: {status['search']}"]
+    for scope, scope_status in status["scopes"]:
+        text = scope_status["result"]
+        if "count" in scope_status:
+            text += f" {scope_status['count']}"
+        omitted = scope_status.get("omitted", 0) + scope_status.get("omitted_attributes", 0)
+        if omitted:
+            text += f"（省略 {omitted}）"
+        parts.append(f"{STATUS_LABELS[scope]}: {text}")
+    return " / ".join(parts)
+
+
+def notable_status(status):
+    """検索の状態に、検索の表示だけでは分からないこと（失敗・読み込めない範囲・省略・一覧を使わなかった）があるか。
+
+    回答AIへは毎ターン渡すが、CLI では、これらがあるターンだけ1行で表示する。
+    """
+    if not status:
+        return False
+    if status["search"] in ("failed", "retry_failed"):
+        return True
+    if (status.get("attribute_list") or {}).get("result") == "not_provided":
+        return True
+    return any(
+        s["result"] in ("unavailable", "not_included") or s.get("omitted") or s.get("omitted_attributes")
+        for _, s in status["scopes"]
+    )
+
+
+def format_attribute_report(retrieval):
+    """属性一覧・属性の選択・R4 についての CLI の表示行。"""
+    lines = []
+    attribute_list = retrieval.attribute_list
+    if attribute_list and attribute_list["total"]:
+        if attribute_list["provided"]:
+            lines.append(f"[属性一覧] {attribute_list['total']}件を渡しました（{attribute_list['chars']}文字）")
+        else:
+            lines.append(
+                f"[属性一覧] {attribute_list['total']}件が上限 {attribute_list['limit']} を超えるため渡していません"
+                "（検索語だけで探しました）"
+            )
+    if retrieval.selected_attributes:
+        names = ", ".join(f"{subject}.{key}" for subject, key in retrieval.selected_attributes)
+        lines.append(f"[属性選択] {names}")
+    reasons = {"not_in_list": "一覧にありません", "ambiguous": "subject が決まりません"}
+    for identifier, reason in retrieval.rejected_attributes:
+        lines.append(f"[属性選択] {identifier} は使いません（{reasons.get(reason, reason)}）")
+    if retrieval.ignored_attributes:
+        lines.append(f"[属性選択] ほかに {len(retrieval.ignored_attributes)} 件の選択を使いませんでした")
+    if retrieval.auto_history_attributes:
+        names = ", ".join(f"{subject}.{key}" for subject, key in retrieval.auto_history_attributes)
+        lines.append(f"[長期履歴] 保留・変更履歴だけに一致したため、変更履歴も渡します: {names}")
+    return lines
+
+
 def normal_turn(session, user_text, output_fn, recorded=False):
     """確認と関係のない、通常の1ターン（検索・回答・各記憶の抽出）。recorded は ChatSession.send と同じ。"""
     try:
@@ -366,10 +437,10 @@ def normal_turn(session, user_text, output_fn, recorded=False):
         retrieval = session.retrieve(user_text)
         for queries, count in retrieval.history_log:
             output_fn(f"[履歴検索] {' / '.join(queries)}")
-            output_fn(f"[履歴検索結果] {count}件")
+            output_fn(f"[履歴検索結果] {format_count(count)}")
         for queries, count in retrieval.memory_history_log:
             output_fn(f"[長期履歴検索] {' / '.join(queries)}")
-            output_fn(f"[長期履歴検索結果] {count}件")
+            output_fn(f"[長期履歴検索結果] {format_count(count)}")
         for number, (queries, count) in enumerate(retrieval.search_log):
             output_fn(f"[{'再検索' if number else '検索'}] {' / '.join(queries)}")
             output_fn(f"[検索結果] {count}件")
@@ -386,6 +457,10 @@ def normal_turn(session, user_text, output_fn, recorded=False):
                 )
             if scope["omitted_attributes"]:
                 output_fn(f"[長期履歴] ほかに {scope['omitted_attributes']} 属性の変更履歴は渡していません")
+        for line in format_attribute_report(retrieval):
+            output_fn(line)
+        if notable_status(retrieval.status):
+            output_fn(f"[検索状態] {format_status_summary(retrieval.status)}")
         for warning in retrieval.warnings:
             output_fn(f"[警告] {warning}")
         reply = session.send(
@@ -397,6 +472,7 @@ def normal_turn(session, user_text, output_fn, recorded=False):
             retrieval.memory_pending,
             recorded=recorded,
             memory_history_scope=retrieval.memory_history_scope,
+            retrieval_status=retrieval.status,
         )
     except LLMError as e:
         output_fn(f"[エラー] {e}")

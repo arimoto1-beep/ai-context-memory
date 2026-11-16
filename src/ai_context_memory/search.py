@@ -20,7 +20,12 @@ MAX_ROUNDS = 2  # 検索プラン作成の上限（0件のときの再検索は1
 MAX_ATTRIBUTES = 5  # 現在値と保留を集める属性の上限
 MAX_HISTORY_ATTRIBUTES = 3  # そのうち、変更履歴を渡す属性の上限
 MAX_ATTRIBUTE_HISTORY_EVENTS = 10  # 1つの属性について渡す変更履歴のイベントの上限（超えたら古いほうを省く）
+# 検索プランナーへ渡す属性一覧の上限。超えたら一覧を渡さず、検索語だけで属性を探す（MVP13 までの方式）
+# 調査では、100属性の一覧で検索プランの入力が約1,000トークン増え（約3,000 → 約4,100）、1,000属性では約12,700トークンになった
+MAX_CATALOG_ATTRIBUTES = 100
 
+# 従来の長期記憶のうち、検索対象にする項目
+MEMORY_SEARCH_KEYS = ("text", "evidence")
 # 作業記憶の変更履歴のイベントのうち、検索対象にする項目
 HISTORY_SEARCH_KEYS = ("operation", "field", "text", "target", "evidence")
 # 構造化した長期記憶の現在値と、その変更履歴のイベントのうち、検索対象にする項目
@@ -41,6 +46,10 @@ class SearchPlan:
     queries: list  # 長期記憶（従来の記憶と構造化した現在値）の検索語
     history_queries: list  # 作業記憶の変更履歴の検索語
     memory_history_queries: list = field(default_factory=list)  # 長期記憶の変更履歴の検索語
+    # 属性一覧から選んだ属性の識別子（検証前の文字列）。一覧との照合は ChatSession.retrieve で行う
+    attributes: list = field(default_factory=list)
+    # 使わなかった属性の選択。長期記憶もその変更履歴も不要という判断と一緒に返された識別子と、文字列でない要素
+    ignored_attributes: list = field(default_factory=list)
 
 
 def normalize(text):
@@ -65,10 +74,29 @@ def _clean_queries(plan, queries_key, needed):
     return cleaned[:MAX_QUERIES]
 
 
+def _clean_attributes(plan, needed):
+    """属性の選択を (使う識別子, 使わない選択) に分ける。キーが無い出力（MVP13 までの形式）は選択なし。
+
+    属性の選択は不正でも検索プラン全体を失敗にはせず、使わない選択として残す（検索語は使えるため）。
+    文字列でない要素や配列でない値は、repr にして使わない選択に入れる。
+    """
+    raw = plan.get("attributes", [])
+    if not isinstance(raw, list):
+        return [], [repr(raw)]
+    texts = [" ".join(a.split()) for a in raw if isinstance(a, str) and a.strip()]
+    ignored = [repr(a) for a in raw if not isinstance(a, str)]
+    if not needed:
+        return [], ignored + texts
+    return list(dict.fromkeys(texts)), ignored
+
+
 def parse_plan(raw):
-    """検索プランナーの出力を、長期記憶と2つの変更履歴それぞれの検索語として解析する。
+    """検索プランナーの出力を、長期記憶と2つの変更履歴それぞれの検索語と、属性の選択として解析する。
 
     変更履歴のキーが無い出力（MVP4・MVP7 形式）は、その変更履歴は不要という判断として扱う。
+    属性の選択（attributes）は、長期記憶か長期記憶の変更履歴の検索が必要という判断と一緒のときだけ使う。
+    needs_memory が false で、長期記憶の変更履歴も不要という判断なら、選択があっても使わない
+    （不要という判断と矛盾する出力では、記憶を渡さないほうを選ぶ）。
     """
     try:
         plan = json.loads(strip_code_fence(raw))
@@ -76,6 +104,10 @@ def parse_plan(raw):
         raise SearchPlanError(f"検索プランがJSONとして読めません ({e.msg})") from e
     if not isinstance(plan, dict):
         raise SearchPlanError("検索プランがJSONオブジェクトではありません")
+    attributes, ignored = _clean_attributes(
+        plan,
+        plan.get("needs_memory") is not False or plan.get("needs_long_term_memory_history") is True,
+    )
     return SearchPlan(
         # needs_memory は省略されていても検索する（MVP4 と同じ）
         _clean_queries(plan, "queries", plan.get("needs_memory") is not False),
@@ -84,6 +116,8 @@ def parse_plan(raw):
         _clean_queries(
             plan, "memory_history_queries", plan.get("needs_long_term_memory_history") is True
         ),
+        attributes,
+        ignored,
     )
 
 
@@ -113,6 +147,15 @@ def _scored(records, queries, keys):
     return scored
 
 
+def matching_records(records, queries, keys):
+    """検索語のどれかにヒットした記録を、上限で切らずに records の順で返す。
+
+    回答AIへ渡す記録を選ぶためではなく、上限で省いた件数を数えることと、R4（現在値には一致せず、
+    保留か変更履歴だけに一致した検索語があるか）の判定に使う。ヒットの判定は search_memories と同じ。
+    """
+    return [records[index] for _, index in _scored(records, queries, keys)]
+
+
 def _search_by_score(records, queries, keys, limit):
     scored = _scored(records, queries, keys)
     # sortedは安定なので、同点は保存順のままになる
@@ -133,7 +176,7 @@ def search_memories(memories, queries, limit=MAX_RESULTS):
     検索語は空白区切りのキーワードで、キーワードがすべて text か evidence に含まれる記憶がヒットする。
     スコアはヒットした検索語のキーワード数の合計。同点は保存順。
     """
-    return _search_by_score(memories, queries, ("text", "evidence"), limit)
+    return _search_by_score(memories, queries, MEMORY_SEARCH_KEYS, limit)
 
 
 def search_memory_state(items, queries, limit=MAX_RESULTS):

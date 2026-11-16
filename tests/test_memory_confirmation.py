@@ -152,9 +152,9 @@ class FakeLLM:
         self.prompts.append(format_prompt(messages, *context))
         return self.replies.pop(0) if self.replies else "はい。"
 
-    def plan_search(self, user_text, previous_queries=(), working_memory=None):
+    def plan_search(self, user_text, previous_queries=(), working_memory=None, attribute_list=None):
         self.calls.append("plan_search")
-        format_search_request(user_text, previous_queries, working_memory)
+        format_search_request(user_text, previous_queries, working_memory, attribute_list)
         return self.plans.pop(0) if self.plans else NOTHING_NEEDED
 
     def extract_memories(self, user_text):

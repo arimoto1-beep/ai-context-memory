@@ -179,14 +179,22 @@ def test_history_hit_alone_brings_the_current_value_and_unresolved_pending(paths
 
 
 def test_pending_hit_brings_the_current_value_of_its_attribute(paths):
-    """保留の名古屋だけがヒットしても、その属性の現在値（川崎）へたどれる。変更履歴は不要なら渡さない。"""
+    """保留の名古屋だけがヒットしても、その属性の現在値（川崎）へたどれる。
+
+    MVP13 では、プランナーが変更履歴を不要と判断すれば変更履歴を渡さなかった。MVP14 では R4 により、
+    検索語（名古屋）が現在値に一致せず保留にだけ一致した属性は、その属性の変更履歴も渡す。
+    """
     prompt, outputs = ask(paths, queries=["名古屋"], question="名古屋の件はどうなった？")
 
     assert state_lines(prompt) == ["- user.home_location: 川崎"]
     assert pending_ids(prompt) == ["p001"]
-    assert "[long-term memory history]" not in prompt
+    assert history_entries(prompt) == [
+        f"{HOME} (events: 1 of 1, complete)",
+        ("add", "home_location", "川崎"),
+    ]
     assert "A社" not in prompt
     assert outputs[1:5] == ["[検索] 名古屋", "[検索結果] 0件", "[長期保留検索] home_location / 名古屋", "[長期保留検索結果] 1件"]
+    assert "[長期履歴] 保留・変更履歴だけに一致したため、変更履歴も渡します: user.home_location" in outputs
 
 
 def test_pending_hit_after_revert_brings_the_current_value_and_history(paths):
@@ -379,7 +387,16 @@ def test_attribute_that_cannot_be_found_sends_nothing_and_claims_nothing(paths):
 
     prompt, outputs = ask(paths, queries=["住まい"], history=["住まい"], question="いつ住まいを変更した？")
 
-    assert prompt == "[user]\nいつ住まいを変更した？"
+    # 記憶のブロックは無い。属性を特定できず、検索したが一致しなかったことだけを伝え、none_stored とは書かない（MVP14）
+    assert prompt.endswith("[/retrieval status]\n\n[user]\nいつ住まいを変更した？")
+    status = block(prompt, "retrieval status")
+    assert "attributes identified: none" in status
+    assert "long-term memory state: no_match" in status
+    assert "long-term memory history: no_match" in status
+    # 長期記憶（現在値・保留・変更履歴）は保存されているので、none_stored とは書かない
+    assert not any(
+        line.startswith("long-term memory") and "none_stored" in line for line in status.splitlines()
+    )
     assert "[長期履歴検索結果] 0件" in outputs
     assert not any(o.startswith("[長期履歴]") for o in outputs)
 

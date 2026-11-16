@@ -214,8 +214,8 @@ class FakeLLM:
         self.prompts.append(format_prompt(messages, *context))
         return self.replies.pop(0)
 
-    def plan_search(self, user_text, previous_queries=(), working_memory=None):
-        self.plan_inputs.append(format_search_request(user_text, previous_queries, working_memory))
+    def plan_search(self, user_text, previous_queries=(), working_memory=None, attribute_list=None):
+        self.plan_inputs.append(format_search_request(user_text, previous_queries, working_memory, attribute_list))
         result = self.plans.pop(0) if self.plans else NOTHING_NEEDED
         if isinstance(result, Exception):
             raise result
@@ -297,6 +297,18 @@ def run_cli(session, inputs):
 def block(prompt, name):
     assert f"[{name}]" in prompt
     return prompt.split(f"[{name}]\n")[1].split(f"\n[/{name}]")[0]
+
+
+# MVP14: 検索プランナーへは、現在値の属性の識別子だけの一覧を渡す（値は渡さない）
+CATALOG_BLOCK = "[stored attributes]\n- user.favorite_drink\n- user.favorite_fruit\n[/stored attributes]"
+
+
+def without_status(prompt):
+    """MVP14 で回答AIへの入力に付く [retrieval status] ブロック（作業記憶の直後か先頭）を除いた入力。"""
+    if "[retrieval status]\n" not in prompt:
+        return prompt
+    before, rest = prompt.split("[retrieval status]\n", 1)
+    return before + rest.split("[/retrieval status]\n\n", 1)[1]
 
 
 # --- 現在値ファイル ---
@@ -1044,10 +1056,11 @@ def test_current_value_question_gets_current_state_and_does_not_search_history(s
     outputs = run_cli(session, ["今、私の好きな果物は？", "exit"])
 
     assert history_searches == []
-    # 検索プランナーへは現在値も履歴も渡さない
-    assert llm.plan_inputs == ["[question]\n今、私の好きな果物は？"]
+    # 検索プランナーへは現在値も履歴も渡さない（MVP14: 属性の識別子の一覧だけを渡す）
+    assert llm.plan_inputs == [f"{CATALOG_BLOCK}\n\n[question]\n今、私の好きな果物は？"]
+    assert "りんご" not in llm.plan_inputs[0]
     # 現在値のりんごと、従来の記憶（古い梨を含む）の両方が、同じ検索語で取得される
-    assert llm.prompts == [
+    assert [without_status(p) for p in llm.prompts] == [
         f"{APPLE_BLOCK}\n\n"
         "[retrieved memories]\n"
         f"- ユーザーの好きな果物は梨 (origin: user, evidence: {PEAR_TEXT})\n"
@@ -1111,7 +1124,10 @@ def test_general_question_searches_nothing(saved, history_searches):
 
     assert history_searches == []
     assert len(llm.plan_inputs) == 1
-    assert llm.prompts == ["[user]\n1+1は？"]
+    assert [without_status(p) for p in llm.prompts] == ["[user]\n1+1は？"]
+    # 検索しなかったことは、記録が無いこととは別の状態として回答AIへ伝える
+    assert block(llm.prompts[0], "retrieval status").splitlines()[0] == "search: not_needed"
+    assert "long-term memory state: not_searched" in llm.prompts[0]
     assert not any("検索" in o for o in outputs)
 
 
@@ -1124,7 +1140,8 @@ def test_current_state_alone_is_searchable_without_legacy_memories(saved):
 
     # 現在値がヒットすれば再検索しない
     assert len(llm.plan_inputs) == 1
-    assert llm.prompts == [f"{APPLE_BLOCK}\n\n[user]\n今、私の好きな果物は？"]
+    assert [without_status(p) for p in llm.prompts] == [f"{APPLE_BLOCK}\n\n[user]\n今、私の好きな果物は？"]
+    assert "long-term memory state: found 1" in llm.prompts[0]
     assert outputs[1:3] == ["[検索] favorite_fruit", "[検索結果] 1件"]
 
 
@@ -1148,7 +1165,7 @@ def test_retry_happens_only_when_both_long_term_sources_have_no_hits(saved, hist
         "[検索結果] 3件",
     ]
     assert llm.plan_inputs[1] == (
-        "[question]\n今、私の好きなフルーツは？\n\n[previous queries: 0 hits]\n- フルーツ"
+        f"{CATALOG_BLOCK}\n\n[question]\n今、私の好きなフルーツは？\n\n[previous queries: 0 hits]\n- フルーツ"
     )
     # 変更履歴の検索語は0件でも、再検索でヒットした現在値の属性の変更履歴を渡す（MVP13）
     assert block(llm.prompts[0], "long-term memory history") == (
@@ -1165,7 +1182,16 @@ def test_planner_is_not_called_when_there_is_nothing_to_search(paths):
     run_cli(session, ["前に好きだった果物は？", "exit"])
 
     assert llm.plan_inputs == []
-    assert llm.prompts == ["[user]\n前に好きだった果物は？"]
+    assert [without_status(p) for p in llm.prompts] == ["[user]\n前に好きだった果物は？"]
+    # 何も保存されていないことを確かめられた範囲だけ none_stored（MVP14）
+    assert block(llm.prompts[0], "retrieval status") == (
+        "search: skipped\n"
+        "long-term memory state: none_stored\n"
+        "long-term memory pending: none_stored\n"
+        "long-term memory history: none_stored\n"
+        "retrieved memories: none_stored\n"
+        "working memory history: none_stored"
+    )
 
 
 def test_conversation_continues_without_history_file_or_hits(saved, history_searches):
@@ -1207,7 +1233,12 @@ def test_broken_plan_searches_nothing_and_conversation_continues(saved, history_
 
     assert history_searches == []
     assert any(o.startswith("[警告] 記憶を検索できませんでした") for o in outputs)
-    assert llm.prompts == ["[user]\n前に好きだった果物は？"]
+    assert [without_status(p) for p in llm.prompts] == ["[user]\n前に好きだった果物は？"]
+    # 検索の失敗は「見つからなかった」ではなく unavailable として伝える。例外のメッセージは渡さない（MVP14）
+    status = block(llm.prompts[0], "retrieval status")
+    assert status.splitlines()[0] == "search: failed"
+    assert "long-term memory state: unavailable" in status
+    assert "検索します" not in status and "JSON" not in status
 
 
 # --- 作業記憶と一緒に動く ---
@@ -1223,8 +1254,10 @@ def test_all_blocks_are_sent_in_order_with_working_memory(saved):
     outputs = run_cli(session, ["果物の好みと対象環境は、それぞれどう変わってきた？", "exit"])
 
     assert len(llm.plan_inputs) == 1
-    assert llm.plan_inputs[0].startswith(f"{WORKING_BLOCK}\n\n[question]\n")
-    assert llm.prompts[0] == (
+    assert llm.plan_inputs[0].startswith(f"{WORKING_BLOCK}\n\n{CATALOG_BLOCK}\n\n[question]\n")
+    # 検索の状態は作業記憶の直後に置く（MVP14）
+    assert llm.prompts[0].startswith(f"{WORKING_BLOCK}\n\n[retrieval status]\n")
+    assert without_status(llm.prompts[0]) == (
         f"{WORKING_BLOCK}\n\n"
         "[working memory history]\n"
         "- 2026-10-07T18:48:45+09:00\n"
