@@ -84,6 +84,9 @@ from .search import (
     search_working_memory_history,
 )
 from .structured_memory import (
+    COVERAGE_COMPLETE,
+    COVERAGE_UNAVAILABLE,
+    EXTRACTION_MAX_VALUE_ATTRIBUTES,
     OP_ADD,
     OP_PENDING,
     OP_REPLACE,
@@ -95,6 +98,7 @@ from .structured_memory import (
     attribute_catalog,
     attribute_history,
     attribute_of,
+    extraction_view,
     load_memory_history,
     load_memory_pending,
     load_memory_state,
@@ -145,6 +149,8 @@ class Retrieval:
     rejected_attributes: list = field(default_factory=list)  # 一覧と一致しなかった選択の (識別子, 理由)
     ignored_attributes: list = field(default_factory=list)  # 使わなかった選択（不要という判断と一緒に返された、上限超えなど）
     auto_history_attributes: list = field(default_factory=list)  # R4 で、プランナーの判断によらず変更履歴を渡した属性
+    # MVP15: 最後に使った長期記憶の検索語が、現在値か保留に一致した属性（一致の順）。抽出AIへ値を渡す属性の候補
+    query_attributes: list = field(default_factory=list)
     status: dict = None  # 回答AIへ渡す検索の状態（llm.format_retrieval_status）。検索を始めていなければ None
 
 
@@ -245,11 +251,19 @@ class ChatSession:
         self.awaiting_revert = None  # 変更内容の出力処理が正常に終わり、y/N を待っている
         # 反映の途中で失敗して復旧できなかったときの理由。設定されている間は長期状態を書き換えない
         self.write_blocked = None
+        self.turn = 0  # 入力のターンの番号（AI呼び出しの記録に付ける）
+        self.last_extraction_view = None  # 直近の update_memory_state で抽出AIへ渡した範囲（structured_memory.extraction_view）
         self.startup_messages = []
         if memory_confirmations_path and memory_state_path and memory_pending_path:
             self._recover_confirmations()
         if self._revert_ready():
             self._recover_reverts()
+
+    def begin_turn(self):
+        """入力1つの処理を始める。ターンの番号を進め、AI呼び出しの記録に付けられるようにする。"""
+        self.turn += 1
+        if hasattr(self.llm, "turn"):
+            self.llm.turn = self.turn
 
     # --- 保留の確認 ---
 
@@ -1185,6 +1199,17 @@ class ChatSession:
                 break
             tried += queries
         result.selected_attributes = list(chosen)
+        if result.search_log:
+            last_queries = result.search_log[-1][0]
+            result.query_attributes = list(
+                dict.fromkeys(
+                    [
+                        attribute_of(item["subject"], item["key"])
+                        for item in search_memory_state(self.memory_state, last_queries, EXTRACTION_MAX_VALUE_ATTRIBUTES)
+                    ]
+                    + [attribute for pending in found_pending for attribute in pending_attributes(pending)]
+                )
+            )
         hits = (
             [attribute_of(item["subject"], item["key"]) for item in result.memory_state]
             + [attribute for pending in found_pending for attribute in pending_attributes(pending)]
@@ -1490,24 +1515,54 @@ class ChatSession:
                     warnings.append(str(e))
         return changes, warnings
 
-    def update_memory_state(self, user_text):
+    def _store_problem(self):
+        """保存されている現在値が、このセッションの持っている現在値と同じかを確かめる。同じなら None、違えば理由。
+
+        抽出AIへ渡す key の一覧が「保存されている属性のすべて」だと言えるのは、同じだと確かめられたときだけ。
+        """
+        try:
+            stored = load_memory_state(self.memory_state_path)
+        except StructuredMemoryError:
+            return "保存されている長期状態を読み込めませんでした"
+        if stored != self.memory_state:
+            return "保存されている長期状態が、このセッションの外で変更されています"
+        return None
+
+    def update_memory_state(self, user_text, retrieval=None):
         """ユーザー発話と既存の値の関係をLLMに判断させ、検証して反映し、(変更のリスト, 警告メッセージ) を返す。
 
-        判断の入力は現在値（subject / key / value）とユーザー発話だけで、assistantの発言は渡さない。
+        判断の入力は現在値とユーザー発話だけで、assistantの発言は渡さない。
         LLMは関係（replace / coexist / pending / no_change）を判断するだけで、
         実行してよいかの確認と状態の書き換えはここで行う。確認できない置き換えは保留にする。
         変更は、現在値の変更（operation が add / replace）と、新しく保存した保留（operation が pending）。
         現在値を保存してから変更履歴を追記し、保留は別のファイルへ保存する。
         失敗しても例外にはせず、警告として返す（会話本体を止めないため）。
+
+        MVP15: LLMへ見せる現在値の範囲は extraction_view で決める（属性が少なければ従来どおり全量、
+        多ければ key の一覧と一部の値）。retrieval（このターンの retrieve の結果）があれば、検索プランナーが選んだ属性と
+        検索語に一致した属性の値を渡す。検証は、見せた範囲によらず現在値の全量に対して行う。
+        LLMへ渡した key の一覧が保存されている属性のすべてだと確かめられないとき（属性が多すぎて一覧を渡さなかった、
+        保存されている現在値を読めない・セッションの外で変わった）は、新しい key を自動では追加せず保留にする。
+        保存されている現在値を読めない・セッションの外で変わったときは、置き換えも自動では行わず保留にする
+        （このセッションの現在値で、保存されている内容を上書きしないため。/confirm と /revert もこの状態では実行しない）。
         """
         if not self.memory_state_path:
             return [], []
         if self.write_blocked:
             return [], [f"長期状態の書き込みを停止しています（{self.write_blocked}）。再起動してください"]
+        view = extraction_view(
+            self.memory_state,
+            user_text,
+            store_problem=self._store_problem(),
+            selected=retrieval.selected_attributes if retrieval else (),
+            queried=retrieval.query_attributes if retrieval else (),
+            pending=self.unresolved_pending(),
+        )
+        self.last_extraction_view = view
         try:
-            candidates, recovered = parse_extraction(
-                self.llm.extract_structured_memory(user_text, self.memory_state)
-            )
+            # mode が full なら view["items"] は現在値の全量で、LLMへの入力は従来と同じ
+            raw = self.llm.extract_structured_memory(user_text, view["items"], view)
+            candidates, recovered = parse_extraction(raw)
         except (LLMError, StructuredMemoryError) as e:
             return [], [f"長期状態を抽出できませんでした: {e}"]
 
@@ -1516,7 +1571,12 @@ class ChatSession:
             warnings.append("長期状態の抽出結果にJSON以外の前置きがあったため、末尾のJSONだけを解析しました")
         timestamp = timestamp_now()
         updated, results, rejected = apply_structured_candidates(
-            self.memory_state, candidates, user_text, timestamp
+            self.memory_state,
+            candidates,
+            user_text,
+            timestamp,
+            new_key_hold=view["coverage_reason"] if view["key_coverage"] != COVERAGE_COMPLETE else None,
+            write_hold=view["coverage_reason"] if view["key_coverage"] == COVERAGE_UNAVAILABLE else None,
         )
         warnings += rejected
         changes = [c for c in results if c["operation"] in (OP_ADD, OP_REPLACE)]

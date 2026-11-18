@@ -224,7 +224,7 @@ class FakeLLM:
     def extract_memories(self, user_text):
         return self.extractions.pop(0) if self.extractions else "[]"
 
-    def extract_structured_memory(self, user_text, items):
+    def extract_structured_memory(self, user_text, items, view=None):
         self.structured_inputs.append(format_structured_memory_request(user_text, items))
         result = self.structured.pop(0) if self.structured else "[]"
         if isinstance(result, Exception):

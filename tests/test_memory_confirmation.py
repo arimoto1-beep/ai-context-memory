@@ -161,7 +161,7 @@ class FakeLLM:
         self.calls.append("extract_memories")
         return "[]"
 
-    def extract_structured_memory(self, user_text, items):
+    def extract_structured_memory(self, user_text, items, view=None):
         self.calls.append("extract_structured_memory")
         return self.structured.pop(0) if self.structured else "[]"
 

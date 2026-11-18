@@ -18,11 +18,14 @@ from .llm import ClaudeCLI, LLMError
 from .memory import MemoryStoreError
 from .revert import RevertError
 from .structured_memory import (
+    COVERAGE_COMPLETE,
     DECISION_PENDING,
     OP_ADD,
     OP_PENDING,
     OP_REPLACE,
     PENDING_STATUS_REVERTED,
+    VIEW_FULL,
+    VIEW_KEYS,
     StructuredMemoryError,
 )
 from .working_memory import OP_ADD as WORKING_OP_ADD
@@ -40,6 +43,8 @@ DEFAULT_MEMORY_HISTORY_FILE = Path("data") / "long_term_memory_history.jsonl"
 DEFAULT_MEMORY_PENDING_FILE = Path("data") / "long_term_memory_pending.json"
 DEFAULT_MEMORY_CONFIRMATIONS_FILE = Path("data") / "long_term_memory_confirmations.jsonl"
 DEFAULT_MEMORY_REVERTS_FILE = Path("data") / "long_term_memory_reverts.jsonl"
+# AI呼び出しごとの記録（役割・入力文字数・usage・時間・成否）。プロンプトや応答の本文は含めない
+DEFAULT_AI_CALL_LOG_FILE = Path("data") / "ai_calls.jsonl"
 
 # 保留の確認と、確定の取り消しのコマンド。これ以外の「/」で始まる入力は、これまでどおり通常の発言として扱う
 COMMAND_PENDING = "/pending"
@@ -76,6 +81,7 @@ def run(session, input_fn=input, output_fn=print):
                 output_fn(f"[警告] {warning}")
             break
 
+        session.begin_turn()
         if session.awaiting_revert:
             # 取り消しの実行前の確認。y 以外の入力（コマンドを含む）は、すべて「実行しない」
             report_revert(session.approve_revert(user_text), output_fn)
@@ -503,10 +509,13 @@ def normal_turn(session, user_text, output_fn, recorded=False):
 
     # 構造化した長期記憶の抽出も同様に、失敗しても警告だけで続行する
     try:
-        changes, warnings = session.update_memory_state(user_text)
+        changes, warnings = session.update_memory_state(user_text, retrieval)
     except KeyboardInterrupt:
         output_fn("\n[長期状態の抽出を中断しました]")
         return
+    line = format_extraction_view(session.last_extraction_view)
+    if line:
+        output_fn(line)
     for line in format_memory_state_changes(changes):
         output_fn(f"[長期状態] {line}")
     for line in format_memory_pending_changes(changes):
@@ -524,6 +533,34 @@ def normal_turn(session, user_text, output_fn, recorded=False):
         output_fn(f"[作業記憶] {line}")
     for warning in warnings:
         output_fn(f"[警告] {warning}")
+    report_call_log_error(session, output_fn)
+
+
+def report_call_log_error(session, output_fn):
+    """AI呼び出しの記録をファイルへ書けなかったことを、一度だけ表示する（会話は止めない）。"""
+    error = getattr(session.llm, "call_log_error", None)
+    if error and not getattr(session, "call_log_error_reported", False):
+        session.call_log_error_reported = True
+        output_fn(f"[警告] {error}")
+
+
+def format_extraction_view(view):
+    """抽出AIへ渡した現在値の範囲を、従来（全量・一覧は完全）と違うときだけ1行にする。"""
+    if not view or (view["mode"] == VIEW_FULL and view["key_coverage"] == COVERAGE_COMPLETE):
+        return None
+    if view["mode"] == VIEW_FULL:
+        scope = f"全{view['total_attributes']}属性の値"
+    elif view["mode"] == VIEW_KEYS:
+        scope = f"全{view['total_attributes']}属性の key の一覧と、{len(view['value_attributes'])}属性の値"
+    else:
+        scope = (
+            f"{view['total_attributes']}属性のうち {len(view['value_attributes'])}属性の値"
+            "（key の一覧は上限を超えるため渡していません）"
+        )
+    line = f"[長期状態の入力] 抽出に渡した範囲: {scope}"
+    if view["key_coverage"] != COVERAGE_COMPLETE:
+        line += f"。新しい属性は自動では追加しません（{view['coverage_reason']}）"
+    return line
 
 
 def format_working_memory_changes(changes):
@@ -569,10 +606,19 @@ def format_memory_pending_changes(changes):
                 f"[長期保留の理由] AIの判断は {change['decision']} でしたが、"
                 f"自動では反映しませんでした: {change['hold_reason']}"
             )
-        if change["confirmation_question"]:
+        confirmable = bool(change["target_key"]) and change["target_value"] is not None
+        if change["confirmation_question"] and confirmable:
             lines.append(
                 f"[長期保留の確認事項] {change['confirmation_question']}"
                 f"（/confirm {change['id']} で確認できます）"
+            )
+        elif not confirmable:
+            # MVP15: 既存の項目に関係しない保留（新しい属性の追加を止めたものなど）は、/confirm では解決できない
+            if change["confirmation_question"]:
+                lines.append(f"[長期保留の確認事項] {change['confirmation_question']}")
+            lines.append(
+                f"[長期保留] {change['id']} は既存の項目に関係しないため、/confirm では確定できません"
+                "（現在値は変更していません。内容は /pending で確認できます）"
             )
     return lines
 
@@ -603,9 +649,12 @@ def main():
         os.environ.get("ACM_LONG_TERM_MEMORY_CONFIRMATIONS_FILE") or DEFAULT_MEMORY_CONFIRMATIONS_FILE
     )
     memory_reverts_path = Path(os.environ.get("ACM_LONG_TERM_MEMORY_REVERTS_FILE") or DEFAULT_MEMORY_REVERTS_FILE)
+    llm = ClaudeCLI()
+    # AI呼び出しごとの記録の保存先（プロンプトや応答の本文は記録しない）
+    llm.call_log_path = Path(os.environ.get("ACM_AI_CALL_LOG_FILE") or DEFAULT_AI_CALL_LOG_FILE)
     try:
         session = ChatSession(
-            ClaudeCLI(),
+            llm,
             history_path,
             memory_path,
             working_memory_path,

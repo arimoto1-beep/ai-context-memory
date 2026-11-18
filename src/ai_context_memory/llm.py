@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import subprocess
+import time
+from datetime import datetime
 
 from .structured_memory import attribute_base
 from .working_memory import FIELDS
@@ -412,6 +414,23 @@ STRUCTURED_MEMORY_SYSTEM_PROMPT = (
     "扱う属性がなければ [] だけを返してください。"
 )
 
+# MVP15: 長期状態の一部の値だけを渡すとき（VIEW_KEYS / VIEW_SELECTED）にだけ、上の指示の後ろに足す。
+# 全量を渡すとき（VIEW_FULL）の指示と入力は MVP14 までと同じ。
+# 調査では、「一部だけ」と伝えるだけでは同じ意味の属性の別 key での追加を防げなかった。安全策は Python 側にある
+# （key の一覧をすべては渡していないターンでは、新しい key を自動で追加しない）。
+STRUCTURED_MEMORY_VIEW_NOTICE = (
+    "入力に [extraction view] から [/extraction view] までのブロックがある場合、"
+    "[long-term memory state] は長期状態の全部ではなく、一部の属性の値だけを載せています。"
+    "値が載っていない属性も保存されています。"
+    "[stored attributes] から [/stored attributes] までのブロックがある場合、"
+    "それは保存されているすべての属性の subject.key の一覧で、値は含みません"
+    "（番号付きの key は番号の無い key にまとめています）。"
+    "発言と同じ意味の属性が一覧にあれば、値が載っていなくても、その key を一字一句そのまま target_key に使ってください。"
+    "新しい key を作るのは、一覧に同じ意味の属性が無いときだけです。"
+    "[stored attributes] のブロックが無い場合、属性が多すぎるため一覧を渡していません。"
+    "関係する既存の項目が見当たらないことは、その属性の値が保存されていないことを意味しません。"
+)
+
 CONFIRMATION_SYSTEM_PROMPT = (
     "あなたは会話AIの長期状態の保留を確認する係です。"
     "長期状態は、ユーザーについての属性（subject.key）ごとに現在の値を持つ記憶です。"
@@ -713,6 +732,35 @@ def format_structured_memory_request(user_text, items):
     return f"{block}\n\n[utterance]\n{user_text}"
 
 
+def format_structured_memory_view_request(user_text, view):
+    """一部の値だけを渡すとき（structured_memory.extraction_view の mode が full 以外）の抽出AIへの入力。
+
+    範囲の説明（[extraction view]）、すべての属性の key の一覧（mode が keys のときだけ）、値を渡す属性の現在値、発言の順。
+    範囲の説明は件数と状態だけで、値や発言は含めない。
+    """
+    total = view["total_attributes"]
+    if view["keys"]:
+        listed = f"attribute list: complete (all {total} attributes are listed in [stored attributes])"
+    else:
+        listed = f"attribute list: not provided ({total} attributes, more than the limit for listing)"
+    lines = [
+        f"attributes stored: {total}",
+        listed,
+        f"values shown: {len(view['value_attributes'])} of {total} attributes",
+    ]
+    parts = ["[extraction view]\n" + "\n".join(lines) + "\n[/extraction view]"]
+    if view["keys"]:
+        parts.append(
+            format_attribute_list({"attributes": view["keys"], "total": total, "provided": True, "limit": total})
+        )
+    parts.append(
+        format_memory_state(view["items"], with_details=False)
+        or "[long-term memory state]\n(no values shown)\n[/long-term memory state]"
+    )
+    parts.append(f"[utterance]\n{user_text}")
+    return "\n\n".join(parts)
+
+
 def format_confirmation_request(pending, current, question, answer):
     lines = [f"{key}: {pending[key]}" for key in (
         "id", "subject", "target_key", "target_value", "proposed_value", "evidence"
@@ -742,10 +790,58 @@ def format_search_request(user_text, previous_queries=(), working_memory=None, a
     return text
 
 
+# AI呼び出しの役割（呼び出しの記録の role）
+ROLE_ANSWER = "answer"
+ROLE_SEARCH_PLAN = "search_plan"
+ROLE_MEMORY_EXTRACTION = "memory_extraction"
+ROLE_STRUCTURED_MEMORY = "structured_memory_extraction"
+ROLE_WORKING_MEMORY = "working_memory_extraction"
+ROLE_CONFIRMATION = "confirmation_judgment"
+
+# usage のうち記録する項目（claude -p の JSON にあった値をそのまま。無ければ null）
+USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+# modelUsage のうち記録する項目。モデルごとに、出力にあったモデル名のまま記録し、役割の分類はしない
+MODEL_USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+
+
+def _usage_record(result):
+    """claude -p の出力（JSON）から、実際に報告された usage だけを取り出す。推定はしない。
+
+    戻り値は (usage か None, モデルごとの usage か None)。usage の入力トークンの合計（input_tokens_total）は、
+    入力の3項目（キャッシュの作成・読み込みを含む）がすべて整数で報告されたときだけ足す。
+    """
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        usage = {key: usage.get(key) if isinstance(usage.get(key), int) else None for key in USAGE_KEYS}
+        inputs = [usage[key] for key in USAGE_KEYS[:3]]
+        usage["input_tokens_total"] = sum(inputs) if all(isinstance(v, int) for v in inputs) else None
+    else:
+        usage = None
+    models = result.get("modelUsage")
+    if isinstance(models, dict):
+        models = {
+            str(name): {key: values.get(key) if isinstance(values.get(key), int) else None for key in MODEL_USAGE_KEYS}
+            for name, values in models.items()
+            if isinstance(values, dict)
+        }
+    else:
+        models = None
+    return usage, models
+
+
 class ClaudeCLI:
-    def __init__(self, model=None):
+    def __init__(self, model=None, call_log_path=None):
+        """call_log_path を渡すと、AI呼び出し1回ごとの記録（役割・入力文字数・usage・時間・成否）を JSONL で追記する。
+
+        記録にはプロンプトや応答の本文、エラーの詳細（応答の本文を含みうる）を入れない。
+        記録はメモリ上の calls にも残す。ファイルへ書けなくても呼び出しは止めず、call_log_error に理由を残す。
+        """
         # 未指定ならClaude Code側の既定モデルを使う
         self.model = model or os.environ.get("ACM_MODEL")
+        self.call_log_path = call_log_path
+        self.call_log_error = None
+        self.calls = []
+        self.turn = None  # 呼び出しの記録に付ける、会話のターンの番号（ChatSession.begin_turn が設定する）
 
     def complete(
         self,
@@ -774,6 +870,7 @@ class ClaudeCLI:
                 memory_history_scope,
                 retrieval_status,
             ),
+            ROLE_ANSWER,
         )
 
     def plan_search(self, user_text, previous_queries=(), working_memory=None, attribute_list=None):
@@ -786,20 +883,43 @@ class ClaudeCLI:
         return self._run(
             SEARCH_PLAN_SYSTEM_PROMPT,
             format_search_request(user_text, previous_queries, working_memory, attribute_list),
+            ROLE_SEARCH_PLAN,
+            {"retry": bool(previous_queries)},
         )
 
     def extract_memories(self, user_text):
         """ユーザー発言1つから記憶候補を抽出させ、出力テキストをそのまま返す。解析と検証は呼び出し側で行う。"""
-        return self._run(EXTRACTION_SYSTEM_PROMPT, user_text)
+        return self._run(EXTRACTION_SYSTEM_PROMPT, user_text, ROLE_MEMORY_EXTRACTION)
 
-    def extract_structured_memory(self, user_text, items):
+    def extract_structured_memory(self, user_text, items, view=None):
         """ユーザー発言1つについて、長期状態の属性と既存の値との関係を判断させ、出力テキストをそのまま返す。
 
         解析・検証と、状態遷移を実行してよいかの確認は呼び出し側で行う。
-        items は現在の長期状態で、同じ意味の属性に既存の key を再利用し、既存の値との関係を判断できるように渡す。
+        view が無いか mode が full なら、items（現在値の全量）を渡す（MVP14 までと同じ入力）。
+        view（structured_memory.extraction_view）の mode が full 以外なら、key の一覧と items（一部の属性の値）を、
+        範囲の説明と一緒に渡し、指示に STRUCTURED_MEMORY_VIEW_NOTICE を足す。
         """
+        details = None
+        if view is not None:
+            details = {
+                "view": view["mode"],
+                "key_coverage": view["key_coverage"],
+                "attributes": view["total_attributes"],
+                "listed_attributes": len(view["keys"]),
+                "value_attributes": len(view["value_attributes"]),
+            }
+        if view is None or view["mode"] == "full":
+            return self._run(
+                STRUCTURED_MEMORY_SYSTEM_PROMPT,
+                format_structured_memory_request(user_text, items),
+                ROLE_STRUCTURED_MEMORY,
+                details,
+            )
         return self._run(
-            STRUCTURED_MEMORY_SYSTEM_PROMPT, format_structured_memory_request(user_text, items)
+            STRUCTURED_MEMORY_SYSTEM_PROMPT + STRUCTURED_MEMORY_VIEW_NOTICE,
+            format_structured_memory_view_request(user_text, view),
+            ROLE_STRUCTURED_MEMORY,
+            details,
         )
 
     def judge_confirmation(self, pending, current, question, answer):
@@ -808,7 +928,9 @@ class ClaudeCLI:
         渡すのは確認している保留1つ、その既存の項目、表示した質問、回答だけ。解析・検証と状態遷移は呼び出し側で行う。
         """
         return self._run(
-            CONFIRMATION_SYSTEM_PROMPT, format_confirmation_request(pending, current, question, answer)
+            CONFIRMATION_SYSTEM_PROMPT,
+            format_confirmation_request(pending, current, question, answer),
+            ROLE_CONFIRMATION,
         )
 
     def extract_working_memory(self, user_text, working_memory):
@@ -817,12 +939,55 @@ class ClaudeCLI:
         working_memory は現在の作業記憶で、重複を避け、既存項目の置き換え・削除を提案できるように渡す。
         """
         return self._run(
-            WORKING_MEMORY_SYSTEM_PROMPT, format_working_memory_request(user_text, working_memory)
+            WORKING_MEMORY_SYSTEM_PROMPT,
+            format_working_memory_request(user_text, working_memory),
+            ROLE_WORKING_MEMORY,
         )
 
-    def _run(self, system_prompt, prompt):
+    def _record(self, record):
+        """呼び出しの記録を残す。ファイルへ書けなくても例外にしない（会話を止めないため）。"""
+        self.calls.append(record)
+        if not self.call_log_path:
+            return
+        try:
+            self.call_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.call_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except (OSError, TypeError, ValueError, AttributeError) as e:
+            # 記録できなくても、呼び出しの結果（成功なら応答、失敗なら元の LLMError）は変えない
+            self.call_log_error = f"AI呼び出しの記録を保存できませんでした: {self.call_log_path} ({e})"
+
+    def _run(self, system_prompt, prompt, role=None, details=None):
+        """claude -p を1回実行して応答テキストを返す。成否にかかわらず、呼び出しの記録を1件残す。"""
+        record = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "role": role,
+            "turn": self.turn,
+            "model_option": self.model,
+            "system_chars": len(system_prompt),
+            "prompt_chars": len(prompt),
+            "input_chars": len(system_prompt) + len(prompt),
+            "status": "error",
+            "error_kind": None,
+            "elapsed_ms": None,
+            "duration_ms": None,
+            "duration_api_ms": None,
+            "usage": None,
+            "model_usage": None,
+            "details": details,
+        }
+        started = time.perf_counter()
+        try:
+            text, result = self._call(system_prompt, prompt, record)
+        finally:
+            record["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
+            self._record(record)
+        return text
+
+    def _call(self, system_prompt, prompt, record):
         executable = shutil.which("claude")
         if executable is None:
+            record["error_kind"] = "not_found"
             raise LLMError(
                 "claude コマンドが見つかりません。Claude Code をインストールし、PATHを確認してください。"
             )
@@ -852,33 +1017,44 @@ class ClaudeCLI:
                 timeout=TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as e:
+            record["error_kind"] = "timeout"
             raise LLMError(
                 f"claude コマンドが {TIMEOUT_SECONDS} 秒以内に応答しませんでした。"
             ) from e
         except OSError as e:
+            record["error_kind"] = "launch_failed"
             raise LLMError(f"claude コマンドを起動できませんでした: {e}") from e
 
         # 失敗時もstdoutにJSONが出ることがある（未ログイン時など）
         try:
             result = json.loads(completed.stdout)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             result = None
         if not isinstance(result, dict):
             result = {}
         text = result.get("result") or ""
+        # usage は実際に報告されたものだけを記録する（失敗した呼び出しでも、報告があれば残す）
+        record["usage"], record["model_usage"] = _usage_record(result)
+        for key in ("duration_ms", "duration_api_ms"):
+            if isinstance(result.get(key), (int, float)):
+                record[key] = result[key]
 
         if completed.returncode != 0 or result.get("is_error"):
             detail = text or completed.stderr.strip() or completed.stdout.strip() or "詳細不明"
             if "login" in detail.lower() or "logged in" in detail.lower():
+                record["error_kind"] = "not_logged_in"
                 raise LLMError(
                     "Claude Code にログインしていません。"
                     "ターミナルで `claude auth login` を実行してください。"
                     f"（{detail}）"
                 )
+            record["error_kind"] = "exit_error"
             raise LLMError(
                 f"claude コマンドが異常終了しました (終了コード {completed.returncode}): {detail}"
             )
 
         if not text:
+            record["error_kind"] = "no_text"
             raise LLMError("claude コマンドから応答テキストを取得できませんでした。")
-        return text
+        record["status"] = "ok"
+        return text, result

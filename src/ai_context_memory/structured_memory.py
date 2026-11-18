@@ -94,6 +94,25 @@ PENDING_KEYS = (
 )
 PENDING_REQUIRED_KEYS = ("id", "subject", "evidence", "created_at")
 
+# MVP15: 関係判断AI（抽出AI）へ渡す長期状態の範囲。属性数（番号付きの key は番号の無い key にまとめた数）で決める。
+# EXTRACTION_FULL_MAX_ATTRIBUTES 以下: 従来どおり現在値をすべて渡す（VIEW_FULL）。
+# EXTRACTION_KEY_LIST_MAX_ATTRIBUTES 以下: すべての属性の key の一覧と、一部の属性の値を渡す（VIEW_KEYS）。
+# それを超える: key の一覧は渡さず、一部の属性の値だけを渡す（VIEW_SELECTED）。このときは新しい key を自動では追加しない
+# 調査（docs/mvp-15.md）: key の一覧は1属性あたり約20〜27文字で、評価データの値の短い記憶では、100属性まで全量より
+# 小さくならなかった（51属性で +10%、100属性で +5%。値の長い記憶では −13%、−22%）。100属性までは、これまでの評価を
+# すべて行った全量のままにする。300属性の一覧で抽出AIの入力は約7,600トークン（実測）。それを超える一覧での判断は評価していない
+EXTRACTION_FULL_MAX_ATTRIBUTES = 100
+EXTRACTION_KEY_LIST_MAX_ATTRIBUTES = 300
+# VIEW_KEYS / VIEW_SELECTED で値を渡す属性の上限。発言に値がそのまま現れる属性は、上限に関係なく必ず渡す
+EXTRACTION_MAX_VALUE_ATTRIBUTES = 15
+VIEW_FULL = "full"
+VIEW_KEYS = "keys"
+VIEW_SELECTED = "selected"
+# 抽出AIへ渡した key の一覧が、保存されている現在値の属性をすべて含むか
+COVERAGE_COMPLETE = "complete"  # すべて含む（全量の現在値か、全属性の key の一覧を渡した）
+COVERAGE_PARTIAL = "partial"  # 一部だけ（属性が多すぎて一覧を渡さなかった）
+COVERAGE_UNAVAILABLE = "unavailable"  # 保存されている現在値を確かめられなかった（読めない・セッションの外で変わった）
+
 # 同じ属性に同時に有効な値が複数あるとき、2つ目以降の値に付ける key の形（例: home_location_2）。
 # この形の key は、保留の確認で共存と判断したときにここで作るだけで、AIには作らせない。番号は優先順位を表さない
 NUMBERED_KEY_PATTERN = re.compile(r"(?P<base>[a-z][a-z0-9_]*?)_(?P<number>[0-9]+)")
@@ -518,7 +537,78 @@ def _held(candidate, target_key, target, hold_reason):
     }
 
 
-def apply_candidates(items, candidates, user_text, timestamp):
+def attributes_in_text(items, text):
+    """値が text にそのまま現れる現在値の属性を、保存順で重複なく返す（大文字小文字と全角・半角の違いはそろえる）。
+
+    置き換えを自動で実行できるのは、既存の値が発言に現れるときだけ（replace_hold_reason）なので、
+    抽出AIへ一部の値だけを渡すときも、この属性の値は必ず渡す。
+    """
+    return list(
+        dict.fromkeys(
+            attribute_of(item["subject"], item["key"])
+            for item in items
+            if item["value"].strip() and _contains(text, item["value"].strip())
+        )
+    )
+
+
+def extraction_view(items, user_text, store_problem=None, selected=(), queried=(), pending=()):
+    """関係判断AI（抽出AI）へ渡す長期状態の範囲を決める。AIは呼ばない。
+
+    items はこのセッションが持っている現在値の全量（検証にはこれを使う。ここで決めるのはAIへ見せる範囲だけ）。
+    store_problem は、保存されている現在値と items が同じだと確かめられなかった理由（確かめられたら None）。
+    selected（検索プランナーが選んだ属性）、queried（検索語に一致した属性）、pending（未解決の保留）は、
+    VIEW_KEYS / VIEW_SELECTED で値を渡す属性の候補。値を渡す属性の順は、発言に値が現れる属性、selected、
+    queried、新しい保留の属性の順で、発言に値が現れる属性のほかは EXTRACTION_MAX_VALUE_ATTRIBUTES まで。
+
+    戻り値の dict:
+    - mode: VIEW_FULL / VIEW_KEYS / VIEW_SELECTED
+    - key_coverage: COVERAGE_COMPLETE / COVERAGE_PARTIAL / COVERAGE_UNAVAILABLE と、coverage_reason
+    - total_attributes: 現在値の属性の数
+    - keys: AIへ渡す key の一覧（VIEW_KEYS のときだけ。それ以外は空）
+    - items: AIへ値を渡す現在値の項目（VIEW_FULL では全量）
+    - value_attributes: 値を渡した属性（VIEW_FULL では全属性）と、上限で値を渡さなかった候補の数 omitted_value_attributes
+    """
+    catalog = attribute_catalog(items, [])
+    total = len(catalog)
+    if total <= EXTRACTION_FULL_MAX_ATTRIBUTES:
+        mode = VIEW_FULL
+    elif total <= EXTRACTION_KEY_LIST_MAX_ATTRIBUTES:
+        mode = VIEW_KEYS
+    else:
+        mode = VIEW_SELECTED
+    if store_problem:
+        coverage, reason = COVERAGE_UNAVAILABLE, store_problem
+    elif mode == VIEW_SELECTED:
+        coverage = COVERAGE_PARTIAL
+        reason = f"属性が {total} 個あり、key の一覧を渡せる上限 {EXTRACTION_KEY_LIST_MAX_ATTRIBUTES} を超えています"
+    else:
+        coverage, reason = COVERAGE_COMPLETE, None
+    view = {
+        "mode": mode,
+        "key_coverage": coverage,
+        "coverage_reason": reason,
+        "total_attributes": total,
+        "keys": catalog if mode == VIEW_KEYS else [],
+        "items": list(items),
+        "value_attributes": catalog,
+        "omitted_value_attributes": 0,
+    }
+    if mode == VIEW_FULL:
+        return view
+    stored = set(catalog)
+    in_text = attributes_in_text(items, user_text)
+    newest_pending = [a for p in reversed(list(pending)) for a in pending_attributes(p)]
+    others = [a for a in dict.fromkeys([*selected, *queried, *newest_pending]) if a in stored and a not in in_text]
+    room = max(0, EXTRACTION_MAX_VALUE_ATTRIBUTES - len(in_text))
+    chosen = in_text + others[:room]
+    view["value_attributes"] = chosen
+    view["omitted_value_attributes"] = len(others) - len(others[:room])
+    view["items"] = [item for item in items if attribute_of(item["subject"], item["key"]) in set(chosen)]
+    return view
+
+
+def apply_candidates(items, candidates, user_text, timestamp, new_key_hold=None, write_hold=None):
     """AIの判断を検証して現在値へ反映し、(新しい現在値, 変更のリスト, 警告メッセージ) を返す。
 
     元の items は書き換えない。AIの判断（decision）ごとに、ここで許された状態遷移だけを実行する。
@@ -526,6 +616,12 @@ def apply_candidates(items, candidates, user_text, timestamp):
     - coexist: Current に無い key への追加だけ。既存の key と衝突したら上書きせず、同じ値なら何もしない、違えば保留
     - pending: 現在値を変えずに保留
     - no_change: 何もしない
+    items には、AIへ見せた範囲によらず、現在値の全量を渡す（検証は全量に対して行う）。
+    MVP15:
+    - new_key_hold（理由の文字列）があれば、coexist で Current に無い key を追加せず保留にする
+      （抽出AIが既存の属性の一覧をすべては見ていないとき、同じ意味の属性を別の key で確定させないため）
+    - write_hold（理由の文字列）があれば、置き換えも新しい key の追加も行わず保留にする
+      （保存されている現在値を確かめられないとき、items で上書きしないため）
     変更は operation が add / replace のものが現在値の変更で、履歴に残すイベントと同じ形
     （operation / subject / key / value / evidence と、replace のときだけ old_value）。
     operation が pending のものは保留の提案で、現在値も履歴も変えない。timestamp は変更した項目の updated_at になる。
@@ -570,6 +666,8 @@ def apply_candidates(items, candidates, user_text, timestamp):
                 touched.add((subject, key))
                 continue
             hold_reason = replace_hold_reason(candidate, target, user_text)
+            if hold_reason is None and write_hold:
+                hold_reason = f"保存されている長期状態を確かめられないため、自動では置き換えません（{write_hold}）"
             if hold_reason:
                 changes.append(_held(candidate, target_key, target, hold_reason))
                 continue
@@ -610,6 +708,14 @@ def apply_candidates(items, candidates, user_text, timestamp):
                         f"proposed_key の {subject}.{key} は既に現在の長期状態にあり、上書きしません",
                     )
                 )
+            continue
+        if new_key_hold or write_hold:
+            # 見落とした既存の属性と同じ意味かもしれないので、新しい属性としては確定させない
+            reason = (
+                f"既存の属性の一覧をすべては確認できていないため、新しい属性 {subject}.{key} として自動では追加しません"
+                f"（{new_key_hold or write_hold}）"
+            )
+            changes.append(_held(candidate, target_key, target, reason))
             continue
         updated.append(
             {"subject": subject, "key": key, "value": value, "evidence": candidate["evidence"], "updated_at": timestamp}
